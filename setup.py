@@ -1,9 +1,9 @@
-from setuptools import find_packages, setup
+from setuptools import setup
 
 setup(
-    name="arianna-c",
+    name="arianna-chain",
     version="0.1.0",
     description="Arianna-C core engine",
-    packages=find_packages(),
+    py_modules=["arianna_chain"],
     install_requires=["torch", "tokenizers"],
 )

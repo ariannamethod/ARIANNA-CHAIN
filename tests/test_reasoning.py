@@ -1,5 +1,3 @@
-"""Tests for reasoning-related generation helpers."""
-
 from __future__ import annotations
 
 from unittest.mock import patch
@@ -9,14 +7,13 @@ from pathlib import Path
 
 import torch
 
-from arianna_c.generation import generate_consistent_text, generate_with_think, reason_loop
-from arianna_c.tokenizer import tokenizer
+from arianna_chain import generate_consistent_text, generate_with_think, reason_loop, tokenizer
 
 
 def test_generate_with_think_returns_thought_and_final() -> None:
     """Ensure ``generate_with_think`` yields both text and metadata."""
 
-    with patch("arianna_c.generation.generate_text", return_value=("thought", {"c": 1})) as mock_gen:
+    with patch("arianna_chain.generate_text", return_value=("thought", {"c": 1})) as mock_gen:
         result = generate_with_think("prompt")
 
     # The wrapper should request reasoning metadata and return the tuple as-is
@@ -30,11 +27,11 @@ def test_consistency_improves_with_multiple_attempts() -> None:
     side_effect = ["B", "A", "A"]
 
     # Single attempt may yield an inconsistent answer
-    with patch("arianna_c.generation.generate_with_think", side_effect=side_effect):
+    with patch("arianna_chain.generate_with_think", side_effect=side_effect):
         single = generate_consistent_text("prompt", n=1)
 
     # Multiple attempts should recover the majority answer "A"
-    with patch("arianna_c.generation.generate_with_think", side_effect=side_effect):
+    with patch("arianna_chain.generate_with_think", side_effect=side_effect):
         multi = generate_consistent_text("prompt", n=3)
 
     assert single != "A"
@@ -60,10 +57,10 @@ def test_reason_loop_alternates_and_logs() -> None:
             return torch.cat([idx, addition], dim=1)
 
     with (
-        patch("arianna_c.generation.AriannaC", DummyModel),
-        patch("arianna_c.generation.quantize_2bit", lambda _: None),
-        patch("arianna_c.generation.SelfMonitor.__init__", return_value=None),
-        patch("arianna_c.generation.SelfMonitor.log") as mock_log,
+        patch("arianna_chain.AriannaC", DummyModel),
+        patch("arianna_chain.quantize_2bit", lambda _: None),
+        patch("arianna_chain.SelfMonitor.__init__", return_value=None),
+        patch("arianna_chain.SelfMonitor.log") as mock_log,
     ):
         result = reason_loop("Q", max_steps=1)
 

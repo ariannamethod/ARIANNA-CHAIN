@@ -17,7 +17,7 @@ Inspired by Andrej Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT), th
 ## Usage
 
 ```bash
-python -m arianna_c.cli "2+2="
+python arianna_chain.py "2+2="
 ```
 
 ## Reasoning Logger

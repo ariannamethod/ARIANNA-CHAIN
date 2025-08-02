@@ -1,4 +1,4 @@
-from arianna_c.logger import estimate_complexity_and_entropy, ThoughtComplexityLogger
+from arianna_chain import ThoughtComplexityLogger, estimate_complexity_and_entropy
 
 
 def test_estimate_complexity_and_entropy_keywords():
