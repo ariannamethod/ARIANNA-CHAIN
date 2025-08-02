@@ -1,4 +1,4 @@
-"""Self-monitoring utilities for Indiana-C.
+"""Self-monitoring utilities for Arianna-C.
 
 The monitor snapshot the entire repository and logs prompts and
 responses for further fine-tuning. All files are stored inside an
@@ -16,7 +16,7 @@ from pathlib import Path
 class SelfMonitor:
     """Record code snapshots and generation events."""
 
-    def __init__(self, db_path: str = "indiana_memory.sqlite"):
+    def __init__(self, db_path: str = "arianna_memory.sqlite"):
         self.conn = sqlite3.connect(db_path)
         self._init_db()
         self.snapshot_codebase()
@@ -40,7 +40,7 @@ class SelfMonitor:
         for path in root_path.rglob("*"):
             if not path.is_file():
                 continue
-            if path.name == "indiana_memory.sqlite":
+            if path.name == "arianna_memory.sqlite":
                 continue
             data = path.read_bytes()
             sha = hashlib.sha256(data).hexdigest()

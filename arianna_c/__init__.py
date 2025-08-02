@@ -1,6 +1,6 @@
 from .generation import CORE_PROMPT, generate_text, reason_loop
 from .reflection import reflect
-from .model import IndianaC, IndianaCConfig
+from .model import AriannaC, AriannaCConfig
 from .monitor import SelfMonitor
 from .quantize import quantize_2bit
 from .logger import (
@@ -10,8 +10,8 @@ from .logger import (
 )
 
 __all__ = [
-    "IndianaC",
-    "IndianaCConfig",
+    "AriannaC",
+    "AriannaCConfig",
     "generate_text",
     "reason_loop",
     "reflect",

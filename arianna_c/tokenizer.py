@@ -1,4 +1,4 @@
-"""Tokenizer utilities for Indiana-C.
+"""Tokenizer utilities for Arianna-C.
 
 This module provides a simple byte-level Byte Pair Encoding (BPE) tokenizer
 implemented with the `tokenizers` library. The tokenizer is trained at import

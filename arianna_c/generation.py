@@ -1,7 +1,7 @@
 from collections import Counter
 from pathlib import Path
 
-from .model import IndianaC, IndianaCConfig
+from .model import AriannaC, AriannaCConfig
 from .monitor import SelfMonitor
 from .quantize import quantize_2bit
 from .logger import (
@@ -20,7 +20,7 @@ print("core_prompt.txt loaded [OK]")
 def generate_text(
     prompt: str | None = None,
     max_new_tokens: int = 50,
-    config: IndianaCConfig | None = None,
+    config: AriannaCConfig | None = None,
     *,
     log_reasoning: bool = False,
     use_memory: bool = False,
@@ -43,7 +43,7 @@ def generate_text(
         and a dictionary with reasoning statistics is returned instead.
     """
     prompt = prompt or CORE_PROMPT
-    config = config or IndianaCConfig()
+    config = config or AriannaCConfig()
     monitor = SelfMonitor()
     if use_memory:
         examples = monitor.search(prompt, limit=memory_limit)
@@ -52,7 +52,7 @@ def generate_text(
                 f"Prompt: {p}\nOutput: {o}" for p, o in examples
             )
             prompt = f"{combined}\n{prompt}"
-    model = IndianaC(config)
+    model = AriannaC(config)
     quantize_2bit(model)
     model.eval()
     idx = tokenizer.encode(prompt)
@@ -85,7 +85,7 @@ def reason_loop(
     max_steps: int = 5,
     stop_tokens: tuple[str, ...] = ("</think>", "</answer>"),
     max_new_tokens: int = 50,
-    config: IndianaCConfig | None = None,
+    config: AriannaCConfig | None = None,
 ) -> str:
     """Iteratively alternate between ``<think>`` and ``<answer>`` phases.
 
@@ -108,9 +108,9 @@ def reason_loop(
     """
 
     prompt = prompt or CORE_PROMPT
-    config = config or IndianaCConfig()
+    config = config or AriannaCConfig()
     monitor = SelfMonitor()
-    model = IndianaC(config)
+    model = AriannaC(config)
     quantize_2bit(model)
     model.eval()
     text = prompt
@@ -140,7 +140,7 @@ def reason_loop(
 def generate_with_think(
     prompt: str | None = None,
     max_new_tokens: int = 50,
-    config: IndianaCConfig | None = None,
+    config: AriannaCConfig | None = None,
     **kwargs,
 ) -> str | tuple[str, dict[str, float | int]]:
     """Generate text while allowing a hook for reasoning steps.

@@ -1,6 +1,6 @@
 import os
 
-from indiana_c.monitor import SelfMonitor
+from arianna_c.monitor import SelfMonitor
 
 
 def test_search_exact(tmp_path):

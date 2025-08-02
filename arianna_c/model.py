@@ -8,8 +8,8 @@ from .tokenizer import tokenizer
 
 
 @dataclass
-class IndianaCConfig:
-    """Configuration for the Indiana-C transformer."""
+class AriannaCConfig:
+    """Configuration for the Arianna-C transformer."""
 
     block_size: int = 1024
     vocab_size: int | None = None
@@ -24,7 +24,7 @@ class IndianaCConfig:
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config: IndianaCConfig):
+    def __init__(self, config: AriannaCConfig):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         self.key = nn.Linear(config.n_embd, config.n_embd, bias=False)
@@ -61,7 +61,7 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, config: IndianaCConfig):
+    def __init__(self, config: AriannaCConfig):
         super().__init__()
         self.fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.proj = nn.Linear(4 * config.n_embd, config.n_embd)
@@ -74,7 +74,7 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config: IndianaCConfig):
+    def __init__(self, config: AriannaCConfig):
         super().__init__()
         self.ln1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
@@ -87,10 +87,10 @@ class Block(nn.Module):
         return x
 
 
-class IndianaC(nn.Module):
+class AriannaC(nn.Module):
     """A minimal GPT-style model inspired by nanoGPT."""
 
-    def __init__(self, config: IndianaCConfig):
+    def __init__(self, config: AriannaCConfig):
         super().__init__()
         self.config = config
         self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
