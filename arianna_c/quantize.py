@@ -1,4 +1,4 @@
-"""2-bit weight quantization for Indiana-C.
+"""2-bit weight quantization for Arianna-C.
 
 The quantization squeezes model parameters to four discrete levels so
 that the model fits on very small devices while keeping the reasoning

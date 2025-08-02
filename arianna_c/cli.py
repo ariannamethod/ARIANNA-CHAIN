@@ -1,11 +1,11 @@
 import argparse
 
 from .generation import generate_consistent_text, generate_text, reason_loop
-from .model import IndianaCConfig
+from .model import AriannaCConfig
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Indiana-C text generation")
+    parser = argparse.ArgumentParser(description="Arianna-C text generation")
     parser.add_argument("prompt", nargs="?", help="prompt to complete")
     parser.add_argument("--max-new-tokens", type=int, default=50)
     parser.add_argument("--verbose", action="store_true", help="show reasoning log")
@@ -34,7 +34,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    config = IndianaCConfig(vocab_size=256)
+    config = AriannaCConfig(vocab_size=256)
     if args.max_steps or args.stop_token:
         loop_kwargs: dict[str, object] = {
             "max_new_tokens": args.max_new_tokens,

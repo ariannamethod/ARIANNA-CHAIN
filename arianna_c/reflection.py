@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from .model import IndianaC, IndianaCConfig
+from .model import AriannaC, AriannaCConfig
 from .quantize import quantize_2bit
 from .tokenizer import tokenizer
 
 
-def reflect(prompt: str, draft: str, max_new_tokens: int = 50, config: IndianaCConfig | None = None) -> str:
+def reflect(prompt: str, draft: str, max_new_tokens: int = 50, config: AriannaCConfig | None = None) -> str:
     """Critique a draft answer using the model.
 
     Args:
@@ -22,8 +22,8 @@ def reflect(prompt: str, draft: str, max_new_tokens: int = 50, config: IndianaCC
         "Provide feedback on the given answer. "
         f"Prompt: {prompt}\nAnswer: {draft}\nCritique:"
     )
-    config = config or IndianaCConfig()
-    model = IndianaC(config)
+    config = config or AriannaCConfig()
+    model = AriannaC(config)
     quantize_2bit(model)
     model.eval()
     idx = tokenizer.encode(critique_prompt)
