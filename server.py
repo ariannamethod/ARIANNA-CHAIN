@@ -8,6 +8,7 @@ import random
 import logging
 import threading
 import hashlib
+import re
 from typing import Dict, Any, Callable, Generator, Tuple, Optional
 from logging.handlers import RotatingFileHandler
 from functools import wraps
@@ -387,8 +388,18 @@ def _extract_usage(resp) -> Dict[str, int]:
         pass
     return usage
 
-def _responses_create(prompt: str, *, model: Optional[str], temperature: float, top_p: float
-                      ) -> Tuple[Dict[str, Any], Dict[str, int], Optional[str]]:
+
+def _detect_red_flags(answer: str) -> list[str]:
+    flags: list[str] = []
+    if re.search(r"<[^/>][^>]*></[^>]+>", answer):
+        flags.append("empty_tag")
+    lower = answer.lower()
+    if ("yes" in lower and "no" in lower) or ("да" in lower and "нет" in lower):
+        flags.append("contradiction")
+    return flags
+
+def _responses_create(prompt: str, *, model: Optional[str], temperature: float, top_p: float,
+                      check_flags: bool = True) -> Tuple[Dict[str, Any], Dict[str, int], Optional[str]]:
     client = _openai_client()
     resp = client.responses.create(
         model=model or MODEL_DEFAULT,
@@ -417,6 +428,25 @@ def _responses_create(prompt: str, *, model: Optional[str], temperature: float, 
     if "confidence" not in obj:
         l = len(obj.get("answer", "")) or 1
         obj["confidence"] = max(0.3, min(0.95, min(l, 800) / 800))
+    if check_flags:
+        flags = _detect_red_flags(obj.get("answer", ""))
+        if flags:
+            app.logger.warning("red flags detected: %s", flags)
+            fix_prompt = (
+                "Исправь ответ, убрав проблемы: "
+                f"{', '.join(flags)}.\n\n" + obj.get("answer", "")
+            )
+            app.logger.info("sending corrective request")
+            obj2, usage2, oid2 = _responses_create(
+                fix_prompt, model=model, temperature=0.0, top_p=top_p, check_flags=False
+            )
+            app.logger.info("corrective response received")
+            if usage2:
+                for k, v in usage2.items():
+                    usage[k] = usage.get(k, 0) + v
+            if oid2:
+                openai_id = oid2
+            obj = obj2
     return obj, usage, openai_id
 
 def _responses_stream(prompt: str, *, model: Optional[str], temperature: float, top_p: float
