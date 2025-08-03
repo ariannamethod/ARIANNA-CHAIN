@@ -1344,6 +1344,33 @@ def generate_with_think(
         **kwargs,
     )
 
+
+def generate_with_review(
+    prompt: Optional[str] = None,
+    *,
+    max_new_tokens: int = 256,
+    use_liquid: bool = True,
+    **kwargs,
+) -> str:
+    """Generate a draft and then critique/correct it in a second pass."""
+    draft = generate_text(
+        prompt,
+        max_new_tokens=max_new_tokens,
+        use_liquid=use_liquid,
+        **kwargs,
+    )
+    draft_text = draft[0] if isinstance(draft, tuple) else draft
+    review_prompt = (
+        f"Review and correct the following draft.\nPrompt: {prompt}\nDraft: {draft_text}"
+    )
+    final = generate_text(
+        review_prompt,
+        max_new_tokens=max_new_tokens,
+        use_liquid=use_liquid,
+        **kwargs,
+    )
+    return final[0] if isinstance(final, tuple) else final
+
 def generate_consistent_text(prompt: Optional[str] = None, n: int = 3, **kwargs) -> str:
     prompt = (prompt or CORE_PROMPT).strip()
     results: List[str] = []
@@ -1368,6 +1395,7 @@ def main() -> None:
     parser.add_argument("--verbose", action="store_true", help="show reasoning log")
     parser.add_argument("--consistency", type=int, default=1, help="n attempts for consistency vote")
     parser.add_argument("--reflect", action="store_true", help="self-reflection using liquid weights")
+    parser.add_argument("--self-critique", action="store_true", help="draft then critique for final answer")
     parser.add_argument("--use-memory", action="store_true", help="prepend similar past prompts")
     parser.add_argument("--max-steps", type=int, default=0, help="ReAct steps (use reason_loop)")
     parser.add_argument("--no-liquid", action="store_true", help="disable liquid server (fallback to toy)")
@@ -1424,14 +1452,21 @@ def main() -> None:
                     buf = str(data.get("answer", buf))
             print(buf)
         else:
-            result = generate_text(
-                args.prompt,
-                use_memory=args.use_memory,
-                self_reflect=args.reflect,
-                use_liquid=use_liquid,
-                max_new_tokens=args.max_new_tokens,
-                log_reasoning=args.verbose,
-            )
+            if args.self_critique:
+                result = generate_with_review(
+                    args.prompt,
+                    use_liquid=use_liquid,
+                    max_new_tokens=args.max_new_tokens,
+                )
+            else:
+                result = generate_text(
+                    args.prompt,
+                    use_memory=args.use_memory,
+                    self_reflect=args.reflect,
+                    use_liquid=use_liquid,
+                    max_new_tokens=args.max_new_tokens,
+                    log_reasoning=args.verbose,
+                )
             if args.verbose:
                 text, meta = result  # type: ignore[assignment]
                 print(text)
@@ -1458,6 +1493,7 @@ __all__ = [
     "estimate_complexity_and_entropy",
     "thought_logger",
     "generate_with_think",
+    "generate_with_review",
     "generate_consistent_text",
     "tokenizer",
     "ByteTokenizer",
