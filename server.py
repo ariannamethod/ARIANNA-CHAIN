@@ -1,4 +1,5 @@
-# server.py — "liquid weights" server (Responses API + JSON Schema + SSE + cache), flake8: noqa
+# flake8: noqa
+# server.py — "liquid weights" server (Responses API + JSON Schema + SSE + cache)
 # CHANGES (key):
 # - Hardened cache (SimHash near-dup + TTL LRU) kept, minor guards.
 # - Safer prompt sanitizer (truncates giant code-blocks, base64 redaction).

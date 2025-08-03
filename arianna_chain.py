@@ -1,11 +1,12 @@
-# arianna_chain.py — "liquid weights" (CPU-only, W2A8 int-core), flake8: noqa
+# flake8: noqa
+# arianna_chain.py — "liquid weights" (CPU-only, W2A8 int-core)
 # CHANGES (key):
 # - Safer HTTP integration points remain outside; this file is self-contained.
 # - W2A8 Linear: fixed byte-offset math + clarified per-group packing; tiny cache.
 # - SelfMonitor: WAL + safe ALTER; optional embeddings off by ARIANNA_DISABLE_EMBED=1.
 # - Tools: kept minimal/safe set; redaction hardened.
 # - Reason loops: same API; better stagnation/consistency heuristics; more robust fallbacks.
-# - ByteTokenizer: deterministic [T] 1D tensors; decode safe.
+# - ByteTokenizer: 2D batched tensors with correct token counting.
 # - Minor cleanups, comments, and bounds.
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ except Exception:  # pragma: no cover
     faiss = None
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any, Iterable, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -123,14 +124,24 @@ if resonance.intensity > threshold:
 CORE_PROMPT = PERSONA
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Byte tokenizer (fixed: 1D tensors, correct counts)
-# ────────────────────────────────────────────────────────────────────────────────
+class TokenTensor(torch.Tensor):
+    """Tensor subclass whose ``len`` returns token count for 2D inputs."""
+
+    @staticmethod
+    def wrap(t: torch.Tensor) -> "TokenTensor":
+        return torch.Tensor._make_subclass(TokenTensor, t, require_grad=t.requires_grad)
+
+    def __len__(self) -> int:  # pragma: no cover - thin wrapper
+        return int(self.shape[-1])
+
+
 class ByteTokenizer:
     vocab_size: int = 256
 
     def encode(self, text: str) -> torch.Tensor:
         arr = list(text.encode("utf-8", errors="replace"))
-        return torch.tensor(arr, dtype=torch.long)  # [T]
+        t = torch.tensor(arr, dtype=torch.long).unsqueeze(0)  # [1,T]
+        return TokenTensor.wrap(t)
 
     def decode(self, tokens: torch.Tensor) -> str:
         arr = [int(x) for x in tokens.reshape(-1).tolist()]
@@ -196,7 +207,7 @@ class ThoughtComplexityLogger:
     ) -> ThoughtLogEntry:
         valid = validate_reasoning_tags(message)
         entry = ThoughtLogEntry(
-            timestamp=datetime.utcnow().isoformat() + "Z",
+            timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             message=message,
             tokens=max(0, int(tokens)),
             entropy=float(entropy),
@@ -218,10 +229,10 @@ def estimate_complexity_and_entropy(
     *,
     n: int = 2,
 ) -> tuple[int, float, float | None]:
-    tokens_1d = tokenizer.encode(message)        # [T]
-    token_count = int(tokens_1d.numel())
+    tokens_1d = tokenizer.encode(message)        # [1,T]
+    token_count = int(tokens_1d.shape[-1])
     n = max(1, min(n, token_count))
-    arr = tokens_1d.tolist()
+    arr = tokens_1d.reshape(-1).tolist()
     counts: Counter[tuple[int, ...]] = Counter(
         tuple(arr[i : i + n]) for i in range(max(0, token_count - n + 1))
     )
@@ -237,11 +248,16 @@ def estimate_complexity_and_entropy(
     if model is not None and token_count > 1:
         model.eval()
         with torch.no_grad():
-            inp = tokens_1d.unsqueeze(0)  # [1,T]
-            _, loss = model(inp[:, :-1], inp[:, 1:])
+            inp = tokens_1d  # [1,T]
+            out = model(inp[:, :-1], inp[:, 1:])
+            loss = out[1] if isinstance(out, tuple) else out
             if loss is not None:
-                perplexity = float(torch.exp(loss))
-                entropy /= max(perplexity, 1e-8)
+                try:
+                    loss_t = loss if isinstance(loss, torch.Tensor) else torch.tensor(float(loss))
+                    perplexity = float(torch.exp(loss_t))
+                    entropy /= max(perplexity, 1e-8)
+                except Exception:
+                    pass
     return token_count, float(entropy), perplexity
 
 thought_logger = ThoughtComplexityLogger()
@@ -844,7 +860,7 @@ def _tool_math_eval(expr: str) -> str:
     return str(result)
 
 def _tool_time_now() -> str:
-    return datetime.utcnow().isoformat() + "Z"
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 def _tool_text_regex_extract(pattern: str, text: str, limit: int = 10, flags: str = "") -> str:
     fl = 0
@@ -1102,15 +1118,17 @@ def reason_loop(
                     candidates.append(call_liquid(ctx, trace_id=trace_id, temperature=t))
                 except Exception:
                     model = AriannaC(AriannaCConfig())
-                    idx = tokenizer.encode(ctx).unsqueeze(0)
+                    idx = tokenizer.encode(ctx)
                     out = model.generate(idx, max_new_tokens=128)
-                    candidates.append({"mode": "final", "think": "", "answer": tokenizer.decode(out[0]), "stop": True, "step": step_idx, "trace_id": trace_id, "confidence": 0.6})
+                    tok = out[0] if out.dim() > 1 else out
+                    candidates.append({"mode": "final", "think": "", "answer": tokenizer.decode(tok), "stop": True, "step": step_idx, "trace_id": trace_id, "confidence": 0.6})
                     break
         else:
             model = AriannaC(AriannaCConfig())
-            idx = tokenizer.encode(ctx).unsqueeze(0)
+            idx = tokenizer.encode(ctx)
             out = model.generate(idx, max_new_tokens=128)
-            candidates.append({"mode": "final", "think": "", "answer": tokenizer.decode(out[0]), "stop": True, "step": step_idx, "trace_id": trace_id, "confidence": 0.6})
+            tok = out[0] if out.dim() > 1 else out
+            candidates.append({"mode": "final", "think": "", "answer": tokenizer.decode(tok), "stop": True, "step": step_idx, "trace_id": trace_id, "confidence": 0.6})
 
         obj = max(candidates, key=_reason_reward)
 
@@ -1369,18 +1387,19 @@ class CausalSelfAttention(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B,T,C = x.size()
-        k = self.key(x).view(B,T,self.n_head,self.head_dim).transpose(1,2)
-        q = self.query(x).view(B,T,self.n_head,self.head_dim).transpose(1,2)
-        v = self.value(x).view(B,T,self.n_head,self.head_dim).transpose(1,2)
+        B, T, C = x.size()
+        x_flat = x.view(B * T, C)
+        k = self.key(x_flat).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        q = self.query(x_flat).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = self.value(x_flat).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         att = (q @ k.transpose(-2,-1)) * (1.0 / math.sqrt(self.head_dim))
         att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
         att = torch.softmax(att, dim=-1)
         att = self.attn_dropout(att)
         y = att @ v
-        y = y.transpose(1,2).contiguous().view(B,T,C)
-        y = self.resid_dropout(self.proj(y))
-        return y
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.proj(y.view(B * T, C)).view(B, T, C)
+        return self.resid_dropout(y)
 
 class MLP(nn.Module):
     def __init__(self, config: AriannaCConfig):
@@ -1390,9 +1409,10 @@ class MLP(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = torch.nn.functional.gelu(self.fc(x))
-        x = self.proj(x)
-        return self.dropout(x)
+        B, T, C = x.size()
+        h = torch.nn.functional.gelu(self.fc(x.view(B * T, C)))
+        h = self.proj(h).view(B, T, C)
+        return self.dropout(h)
 
 class Block(nn.Module):
     def __init__(self, config: AriannaCConfig):
@@ -1421,9 +1441,13 @@ class AriannaC(nn.Module):
         torch.set_grad_enabled(False)
 
     def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None):
+        if idx.dim() == 1:
+            idx = idx.unsqueeze(0)
+            if targets is not None and targets.dim() == 1:
+                targets = targets.unsqueeze(0)
         if idx.dim() != 2:
             raise ValueError("idx must be [B,T]")
-        B,T = idx.size()
+        B, T = idx.size()
         if T > self.block_size:
             raise ValueError("seq too long")
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device).unsqueeze(0)
@@ -1433,7 +1457,7 @@ class AriannaC(nn.Module):
         for block in self.blocks:
             x = block(x)
         x = self.ln_f(x)
-        logits = self.head(x)
+        logits = self.head(x.view(B * T, self.config.n_embd)).view(B, T, self.config.vocab_size)
         loss = None
         if targets is not None:
             loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
@@ -1474,9 +1498,10 @@ def reflect(prompt: str, draft: str, *, use_liquid: bool = True, max_new_tokens:
         return str(obj.get("answer", "")) or json.dumps(obj, ensure_ascii=False)
     cfg = config or AriannaCConfig()
     model = AriannaC(cfg)
-    idx = tokenizer.encode("Critique:\n" + critique_prompt).unsqueeze(0)
+    idx = tokenizer.encode("Critique:\n" + critique_prompt)
     out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
-    return tokenizer.decode(out[0])
+    tok = out[0] if out.dim() > 1 else out
+    return tokenizer.decode(tok)
 
 def generate_text(
     prompt: Optional[str] = None,
@@ -1540,15 +1565,17 @@ def generate_text(
             return text
         except Exception:
             model = AriannaC(AriannaCConfig())
-            idx = tokenizer.encode(prompt).unsqueeze(0)
+            idx = tokenizer.encode(prompt)
             out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
-            text = tokenizer.decode(out[0])
+            tok = out[0] if out.dim() > 1 else out
+            text = tokenizer.decode(tok)
             if self_reflect:
                 crit = reflect(prompt, text, use_liquid=False)
                 if "good" not in crit.lower():
-                    idx = tokenizer.encode(f"Revise using this critique. Draft: {text}\nCritique: {crit}").unsqueeze(0)
+                    idx = tokenizer.encode(f"Revise using this critique. Draft: {text}\nCritique: {crit}")
                     out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
-                    text = tokenizer.decode(out[0])
+                    tok = out[0] if out.dim() > 1 else out
+                    text = tokenizer.decode(tok)
                     sm.log("revise", text)
             sm.log(prompt, text)
             tokens, entropy, perplexity = estimate_complexity_and_entropy(text, model)
@@ -1558,15 +1585,17 @@ def generate_text(
                 return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
             return text
     model = AriannaC(AriannaCConfig())
-    idx = tokenizer.encode(prompt).unsqueeze(0)
+    idx = tokenizer.encode(prompt)
     out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
-    text = tokenizer.decode(out[0])
+    tok = out[0] if out.dim() > 1 else out
+    text = tokenizer.decode(tok)
     if self_reflect:
         crit = reflect(prompt, text, use_liquid=False)
         if "good" not in crit.lower():
-            idx = tokenizer.encode(f"Revise using this critique. Draft: {text}\nCritique: {crit}").unsqueeze(0)
+            idx = tokenizer.encode(f"Revise using this critique. Draft: {text}\nCritique: {crit}")
             out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
-            text = tokenizer.decode(out[0])
+            tok = out[0] if out.dim() > 1 else out
+            text = tokenizer.decode(tok)
             sm.log("revise", text)
     sm.log(prompt, text)
     tokens, entropy, perplexity = estimate_complexity_and_entropy(text, model)

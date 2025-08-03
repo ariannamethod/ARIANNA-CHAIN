@@ -1,15 +1,29 @@
 # Arianna-C
 
-Arianna-C is a minimal reasoning engine built to stand alone on the CPU. It keeps the deliberate `<think>`-style reflection and step-by-step planning introduced by the open-source DEEPSEEK R1 engine while removing every dependency on external hosting platforms.
+Arianna‑C ("Arianna Chain") is an autonomous reasoning system engineered for deterministic CPU execution. It centers on an enhanced **DeepSeek R1** reasoning core that we refined with a stricter reflection loop, 2‑bit W2A8 quantized linears, and a secure byte-level tokenizer. The engine preserves the `<think>`/`<answer>` protocol of its DeepSeek ancestor yet operates entirely offline without external services.
 
-The project borrows the R1 core as its reasoning heart. DEEPSEEK released an autonomous chain-of-thought stack, and Arianna-C reuses that public skeleton so CPU deployments still enjoy explicit traces and self-verifying steps without cloud services.
+Mathematically, each step computes a Shannon entropy \(H = -\sum p_i \log_2 p_i\) over sliding n‑grams and cross-entropy against a local surrogate model to estimate perplexity. These signals form a reward heuristic driving self‑correction. Weights are stored in groups of 2‑bit integers packed into bytes; dequantization recovers floating matrices so the transformer block \(f_{\theta}\) obeys standard linear algebra.
 
-On top of the borrowed core, Arianna-C layers a self-monitoring memory inspired by previous experiments like SUPPERTIME and D2C. Each run snapshots the entire codebase and logs prompts and outputs into an embedded database so the system can study and fine-tune itself offline.
+Beyond generation, Arianna‑C logs every thought into a FAISS-backed vector store for retrieval‑augmented reasoning. Timestamps follow RFC 3339 with explicit UTC offsets, enabling reproducible audit trails.
 
-Inspired by Andrej Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT), the core is tiny and readable. Arianna-C is not a fork but a fresh kernel, free from old tensors and designed for autonomy.
+## Railway deployment
+
+Deploy on [Railway](https://railway.app) using the provided `Procfile`. Set:
+
+```
+OPENAI_API_KEY=...      # required for server-side reasoning
+ARIANNA_SERVER_TOKEN=...  # optional auth token
+```
+
+Then run:
+
+```
+railway up
+```
+
+Railway supplies `PORT`; `server.py` binds Gunicorn to it and exposes `/generate` and `/generate_sse`.
 
 ## Features
-
 - Pure PyTorch implementation
 - CPU-only execution
 - Retains R1 traits such as explicit reasoning traces and self-verification
