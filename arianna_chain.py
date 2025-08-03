@@ -618,8 +618,11 @@ def call_liquid(prompt: str, *, temperature: Optional[float] = None, top_p: Opti
 
 def call_liquid_stream(prompt: str, *, temperature: Optional[float] = None, top_p: Optional[float] = None, timeout: float = 60.0) -> Iterable[Tuple[str, Dict[str, Any] | None]]:
     """
-    Возвращает пары (event_type, data_dict). Событие и data «склеены»:
+    Возвращает пары (event_type, data_dict). Возможные типы:
       - ("response.output_text.delta", {"delta": "..."})
+      - ("plan.delta", {"delta": "..."})
+      - ("reasoning.delta", {"delta": "..."})
+      - ("repair.delta", {"delta": "..."})
       - ("response.completed", {...})
       - ("ping", {})
       - ("response.error", {"error": "..."})

@@ -449,6 +449,19 @@ def _responses_create(prompt: str, *, model: Optional[str], temperature: float, 
             obj = obj2
     return obj, usage, openai_id
 
+
+def _extract_field_partial(buf: str, field: str) -> Optional[str]:
+    """Возвращает текущее содержимое поля из частичного JSON."""
+    pat_complete = rf'"{field}"\s*:\s*"(.*?)(?<!\\)"'
+    m = re.search(pat_complete, buf, re.DOTALL)
+    if m:
+        return m.group(1)
+    pat_partial = rf'"{field}"\s*:\s*"(.*)$'
+    m = re.search(pat_partial, buf, re.DOTALL)
+    if m:
+        return m.group(1)
+    return None
+
 def _responses_stream(prompt: str, *, model: Optional[str], temperature: float, top_p: float
                       ) -> Generator[str, None, None]:
     """
@@ -460,6 +473,7 @@ def _responses_stream(prompt: str, *, model: Optional[str], temperature: float, 
     yield "event: ping\ndata: {}\n\n" # моментальный ping
     last_emit = time.time()
     buf = ""
+    field_vals = {"plan": "", "reasoning": "", "repair": ""}
     try:
         with client.responses.stream(
             model=model or MODEL_DEFAULT,
@@ -479,6 +493,15 @@ def _responses_stream(prompt: str, *, model: Optional[str], temperature: float, 
                     d = getattr(ev, "delta", "")
                     buf += d or ""
                     yield f"event: response.output_text.delta\ndata: {json.dumps({'delta': d})}\n\n"
+                    for fld in ("plan", "reasoning", "repair"):
+                        cur = _extract_field_partial(buf, fld)
+                        if cur is None:
+                            continue
+                        prev = field_vals[fld]
+                        if len(cur) > len(prev):
+                            delta_txt = cur[len(prev):]
+                            yield f"event: {fld}.delta\ndata: {json.dumps({'delta': delta_txt})}\n\n"
+                            field_vals[fld] = cur
                     last_emit = time.time()
                 elif et == "response.created":
                     rid = None
