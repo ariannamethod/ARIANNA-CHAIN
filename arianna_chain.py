@@ -12,6 +12,7 @@ import re
 import sqlite3
 import time
 import uuid
+import numpy as np
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -189,6 +190,7 @@ class SelfMonitor:
     _snapshotted = False
     def __init__(self, db_path: str = "arianna_memory.sqlite"):
         self.conn = sqlite3.connect(db_path)
+        self.embed_model = None
         self._init_db()
         if not SelfMonitor._snapshotted:
             self.snapshot_codebase()
@@ -200,6 +202,7 @@ class SelfMonitor:
         cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS prompts_index USING fts5(prompt, output)")
         cur.execute("CREATE TABLE IF NOT EXISTS notes(ts REAL, text TEXT)")
         cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS notes_index USING fts5(text)")
+        cur.execute("CREATE TABLE IF NOT EXISTS embeddings(sha256 TEXT PRIMARY KEY, embedding BLOB)")
         self.conn.commit()
     def snapshot_codebase(self, root: str | Path = ".") -> None:
         root_path = Path(root)
@@ -216,11 +219,25 @@ class SelfMonitor:
             cur = self.conn.cursor()
             cur.execute("INSERT OR REPLACE INTO files(path, content, sha256) VALUES (?,?,?)", (str(path), sqlite3.Binary(data), sha))
         self.conn.commit()
+    def _ensure_embed_model(self):
+        if self.embed_model is None:
+            try:
+                from sentence_transformers import SentenceTransformer
+
+                name = os.getenv("ARIANNA_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+                self.embed_model = SentenceTransformer(name)
+            except Exception:
+                self.embed_model = None
+        return self.embed_model
+
     def log(self, prompt: str, output: str) -> None:
         sha = hashlib.sha256(prompt.encode("utf-8", errors="ignore")).hexdigest()
         cur = self.conn.cursor()
         cur.execute("INSERT INTO logs(ts, prompt, output, sha256) VALUES (?,?,?,?)", (time.time(), prompt, output, sha))
         cur.execute("INSERT INTO prompts_index(prompt, output) VALUES (?,?)", (prompt, output))
+        if self._ensure_embed_model():
+            vec = self.embed_model.encode([prompt])[0].astype("float32").tobytes()
+            cur.execute("INSERT OR REPLACE INTO embeddings(sha256, embedding) VALUES (?,?)", (sha, sqlite3.Binary(vec)))
         self.conn.commit()
     def note(self, text: str) -> None:
         cur = self.conn.cursor()
@@ -241,8 +258,36 @@ class SelfMonitor:
         cur.execute("SELECT prompt, output FROM logs WHERE sha256 = ? LIMIT ?", (sha, limit))
         rows = cur.fetchall()
         return rows or self._search_tfidf(prompt, limit=limit)
+
+    def search_embedding(self, query: str, limit: int = 5) -> list[tuple[str, str]]:
+        if not self._ensure_embed_model():
+            return []
+        qv = self.embed_model.encode([query])[0].astype("float32")
+        cur = self.conn.cursor()
+        cur.execute("SELECT sha256, embedding FROM embeddings")
+        rows = cur.fetchall()
+        if not rows:
+            return []
+        sha_list: list[str] = []
+        mat = []
+        for sha, blob in rows:
+            vec = np.frombuffer(blob, dtype=np.float32)
+            sha_list.append(sha)
+            mat.append(vec)
+        emb_matrix = np.stack(mat)
+        q_norm = np.linalg.norm(qv) + 1e-9
+        sims = (emb_matrix @ qv) / (np.linalg.norm(emb_matrix, axis=1) * q_norm + 1e-9)
+        top_idx = np.argsort(-sims)[:limit]
+        out: list[tuple[str, str]] = []
+        for i in top_idx:
+            sha = sha_list[int(i)]
+            cur.execute("SELECT prompt, output FROM logs WHERE sha256 = ? ORDER BY ts DESC LIMIT 1", (sha,))
+            row = cur.fetchone()
+            if row:
+                out.append(row)
+        return out
     def search_prompts_and_notes(self, query: str, limit: int = 5) -> list[str]:
-        prs = self._search_tfidf(query, limit=limit)
+        prs = self.search_embedding(query, limit=limit) or self._search_tfidf(query, limit=limit)
         nts = self._search_notes(query, limit=limit)
         out = []
         for p, o in prs:
@@ -919,7 +964,7 @@ def generate_text(
     prompt = (prompt or CORE_PROMPT).strip()
     sm = SelfMonitor()
     if use_memory:
-        examples = sm.search(prompt, limit=memory_limit)
+        examples = sm.search_embedding(prompt, limit=memory_limit) or sm.search(prompt, limit=memory_limit)
         if examples:
             combined = "\n".join(f"PrevPrompt: {p}\nPrevOutput: {o}" for p, o in examples)
             prompt = f"{combined}\n\nCurrent:\n{prompt}"
