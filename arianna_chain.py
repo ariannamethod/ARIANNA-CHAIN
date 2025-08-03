@@ -717,6 +717,18 @@ def _verify_low_confidence(trace_id: str, user_prompt: str, draft: str) -> str:
     obj = call_liquid(crit, trace_id=trace_id, temperature=0.2)
     return str(obj.get("answer", draft))
 
+
+def verify_step(trace_id: str, user_prompt: str, observation: str) -> str:
+    """Return a short comment assessing the observation's correctness."""
+
+    prompt = (
+        "Assess the following observation for factual correctness or potential issues. "
+        "Return JSON with mode='verify', stop=false, answer=ONLY a brief comment.\n"
+        f"PROMPT:\n{user_prompt}\n\nOBSERVATION:\n{observation}"
+    )
+    obj = call_liquid(prompt, trace_id=trace_id, temperature=0.0)
+    return str(obj.get("answer", ""))
+
 def reason_loop(
     prompt: Optional[str] = None,
     *,
@@ -881,6 +893,22 @@ def reason_loop(
 
         sm.log("<step>", json.dumps(step_obj, ensure_ascii=False))
         steps.append(step_obj)
+        if mode == "act" and observation:
+            try:
+                comment = verify_step(trace_id, user_prompt, observation)
+                verify_obj = {
+                    "trace_id": trace_id,
+                    "step": step_idx + 0.1,
+                    "mode": "verify",
+                    "think": "",
+                    "answer": comment,
+                    "stop": False,
+                    "confidence": 0.7,
+                }
+                sm.log("<step>", json.dumps(verify_obj, ensure_ascii=False))
+                steps.append(verify_obj)
+            except Exception:
+                pass
         if answer:
             final_answer = answer
 

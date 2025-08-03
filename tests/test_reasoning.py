@@ -93,6 +93,38 @@ def test_reason_loop_beam_selects_highest_scoring() -> None:
     assert result == "1. numbered"
 
 
+def test_reason_loop_verifies_after_act() -> None:
+    """Each act step should be followed by a verify step."""
+
+    responses = [
+        {
+            "mode": "act",
+            "think": "",
+            "answer": "",
+            "action": {"name": "dummy", "args": {}},
+            "stop": False,
+            "confidence": 0.7,
+        },
+        {"mode": "final", "think": "", "answer": "done", "stop": True, "confidence": 0.9},
+    ]
+
+    with (
+        patch("arianna_chain.call_liquid", side_effect=responses),
+        patch("arianna_chain.TOOLS", {"dummy": lambda **kw: "obs"}),
+        patch("arianna_chain.verify_step", return_value="looks good") as mock_verify,
+        patch("arianna_chain.SelfMonitor.__init__", return_value=None),
+        patch("arianna_chain.SelfMonitor.log") as mock_log,
+    ):
+        reason_loop("Q", max_steps=2)
+
+    steps = [json.loads(c.args[1]) for c in mock_log.call_args_list if c.args[0] == "<step>"]
+    act_indices = [i for i, s in enumerate(steps) if s["mode"] == "act"]
+    for idx in act_indices:
+        assert idx + 1 < len(steps)
+        assert steps[idx + 1]["mode"] == "verify"
+    mock_verify.assert_called_once()
+
+
 def test_tree_reason_loop_selects_best_branch() -> None:
     """Tree search should evaluate multiple branches and pick the best."""
 
