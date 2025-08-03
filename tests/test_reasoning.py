@@ -186,7 +186,7 @@ def test_reason_loop_uses_retrieval() -> None:
     ]
 
     with (
-        patch("retrieval.vector_store.VectorStore.search", return_value=["doc"]) as mock_search,
+        patch("arianna_chain.VectorStore.search", return_value=["doc"]) as mock_search,
         patch("arianna_chain.call_liquid", side_effect=responses),
         patch("arianna_chain.SelfMonitor.__init__", return_value=None),
         patch("arianna_chain.SelfMonitor.log"),
