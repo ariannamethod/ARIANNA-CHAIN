@@ -45,7 +45,9 @@ def test_generate_with_think_returns_thought_and_final() -> None:
 
     # The wrapper should request reasoning metadata and return the tuple as-is
     assert result == ("thought", {"c": 1})
-    mock_gen.assert_called_once_with("prompt", max_new_tokens=50, config=None, log_reasoning=True)
+    mock_gen.assert_called_once_with(
+        "prompt", max_new_tokens=50, config=None, log_reasoning=True, retrieve=False
+    )
 
 
 def test_consistency_improves_with_multiple_attempts() -> None:
@@ -175,6 +177,23 @@ def test_reason_loop_verifies_after_act() -> None:
         assert idx + 1 < len(steps)
         assert steps[idx + 1]["mode"] == "verify"
     mock_verify.assert_called_once()
+
+
+def test_reason_loop_uses_retrieval() -> None:
+    """Retrieval store should be queried when ``retrieve=True``."""
+    responses = [
+        {"mode": "final", "think": "", "answer": "done", "stop": True, "confidence": 0.9}
+    ]
+
+    with (
+        patch("retrieval.vector_store.VectorStore.search", return_value=["doc"]) as mock_search,
+        patch("arianna_chain.call_liquid", side_effect=responses),
+        patch("arianna_chain.SelfMonitor.__init__", return_value=None),
+        patch("arianna_chain.SelfMonitor.log"),
+    ):
+        reason_loop("Q", max_steps=1, retrieve=True)
+
+    mock_search.assert_called_once()
 
 
 def test_tree_reason_loop_selects_best_branch() -> None:

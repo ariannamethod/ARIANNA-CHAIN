@@ -909,8 +909,18 @@ def reason_loop(
     checkpoint_every: int = 2,
     critical_every: int = 3,
     beams: int = 1,
+    retrieve: bool = False,
 ) -> str:
     user_prompt = (prompt or CORE_PROMPT).strip()
+    if retrieve:
+        try:
+            from retrieval.vector_store import VectorStore
+            store = VectorStore()
+            docs = store.search(user_prompt)
+            if docs:
+                user_prompt = "\n".join(docs) + "\n\n" + user_prompt
+        except Exception:
+            pass
     sm = SelfMonitor()
     trace_id = uuid.uuid4().hex
     steps: List[Dict[str, Any]] = []
@@ -1249,8 +1259,18 @@ def generate_text(
     use_liquid: bool = True,
     max_new_tokens: int = 256,
     log_reasoning: bool = False,
-) -> str | tuple[str, dict[str, float | int]]:
+    retrieve: bool = False,
+    ) -> str | tuple[str, dict[str, float | int]]:
     prompt = (prompt or CORE_PROMPT).strip()
+    if retrieve:
+        try:
+            from retrieval.vector_store import VectorStore
+            store = VectorStore()
+            docs = store.search(prompt)
+            if docs:
+                prompt = "\n".join(docs) + "\n\n" + prompt
+        except Exception:
+            pass
     sm = SelfMonitor()
     if use_memory:
         examples = sm.search_embedding(prompt, limit=memory_limit) or sm.search(prompt, limit=memory_limit)
@@ -1334,6 +1354,7 @@ def generate_with_think(
     *,
     max_new_tokens: int = 50,
     config: AriannaCConfig | None = None,
+    retrieve: bool = False,
     **kwargs,
 ) -> str | tuple[str, dict[str, float | int]]:
     return generate_text(
@@ -1341,6 +1362,7 @@ def generate_with_think(
         max_new_tokens=max_new_tokens,
         config=config,
         log_reasoning=True,
+        retrieve=retrieve,
         **kwargs,
     )
 
@@ -1377,6 +1399,7 @@ def main() -> None:
     parser.add_argument("--critical-every", type=int, default=3, help="run critical check every N steps")
     parser.add_argument("--beams", type=int, default=1, help="number of candidate beams per step")
     parser.add_argument("--beam-size", type=int, default=1, help="number of reasoning branches for tree search")
+    parser.add_argument("--retrieve", action="store_true", help="augment prompt with retrieved docs")
     args = parser.parse_args()
 
     use_liquid = not args.no_liquid
@@ -1392,6 +1415,7 @@ def main() -> None:
                 progress_patience=args.progress_patience,
                 critical_every=args.critical_every,
                 beams=args.beams,
+                retrieve=args.retrieve,
             )
         else:
             result = reason_loop(
@@ -1402,6 +1426,7 @@ def main() -> None:
                 progress_patience=args.progress_patience,
                 critical_every=args.critical_every,
                 beams=args.beams,
+                retrieve=args.retrieve,
             )
         print(result)
     elif args.consistency > 1:
@@ -1412,6 +1437,7 @@ def main() -> None:
             self_reflect=args.reflect,
             use_liquid=use_liquid,
             max_new_tokens=args.max_new_tokens,
+            retrieve=args.retrieve,
         )
         print(result)
     else:
@@ -1431,6 +1457,7 @@ def main() -> None:
                 use_liquid=use_liquid,
                 max_new_tokens=args.max_new_tokens,
                 log_reasoning=args.verbose,
+                retrieve=args.retrieve,
             )
             if args.verbose:
                 text, meta = result  # type: ignore[assignment]
