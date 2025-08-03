@@ -266,8 +266,13 @@ class SelfMonitor:
         cur.execute("CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, content BLOB, sha256 TEXT)")
         cur.execute("CREATE TABLE IF NOT EXISTS logs(ts REAL, prompt TEXT, output TEXT, sha256 TEXT)")
         cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS prompts_index USING fts5(prompt, output)")
-        cur.execute("CREATE TABLE IF NOT EXISTS notes(ts REAL, text TEXT)")
+        cur.execute("CREATE TABLE IF NOT EXISTS notes(ts REAL, text TEXT, sha256 TEXT)")
+        try:
+            cur.execute("ALTER TABLE notes ADD COLUMN sha256 TEXT")
+        except sqlite3.OperationalError:
+            pass
         cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS notes_index USING fts5(text)")
+        cur.execute("CREATE TABLE IF NOT EXISTS links(src_sha TEXT, dst_sha TEXT, relation TEXT)")
         cur.execute("CREATE TABLE IF NOT EXISTS embeddings(sha256 TEXT PRIMARY KEY, embedding BLOB)")
         self.conn.commit()
     def snapshot_codebase(self, root: str | Path = ".") -> None:
@@ -326,10 +331,40 @@ class SelfMonitor:
             cur.execute("INSERT OR REPLACE INTO embeddings(sha256, embedding) VALUES (?,?)", (sha, sqlite3.Binary(vec)))
         self.conn.commit()
     def note(self, text: str) -> None:
+        sha = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
         cur = self.conn.cursor()
-        cur.execute("INSERT INTO notes(ts, text) VALUES (?, ?)", (time.time(), text))
+        cur.execute("INSERT INTO notes(ts, text, sha256) VALUES (?, ?, ?)", (time.time(), text, sha))
         cur.execute("INSERT INTO notes_index(text) VALUES (?)", (text,))
         self.conn.commit()
+    def link_prompt(self, prompt_sha: str, note_sha: str, relation: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT INTO links(src_sha, dst_sha, relation) VALUES (?,?,?)",
+            (prompt_sha, note_sha, relation),
+        )
+        self.conn.commit()
+    def graph_search(self, start_sha: str, depth: int) -> list[tuple[str, str, str]]:
+        cur = self.conn.cursor()
+        visited = {start_sha}
+        frontier = {start_sha}
+        edges: set[tuple[str, str, str]] = set()
+        for _ in range(depth):
+            next_frontier = set()
+            for sha in frontier:
+                cur.execute(
+                    "SELECT src_sha, dst_sha, relation FROM links WHERE src_sha = ? OR dst_sha = ?",
+                    (sha, sha),
+                )
+                for src, dst, rel in cur.fetchall():
+                    edges.add((src, dst, rel))
+                    neighbor = dst if src == sha else src
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        next_frontier.add(neighbor)
+            frontier = next_frontier
+            if not frontier:
+                break
+        return list(edges)
     def _search_tfidf(self, query: str, limit: int = 5, return_scores: bool = False):
         cur = self.conn.cursor()
         cur.execute(
@@ -632,6 +667,11 @@ def _tool_memory_note(text: str) -> str:
     sm.note(_redact(text)[:1000])
     return "ok"
 
+def _tool_memory_link(prompt_sha: str, note_sha: str, relation: str) -> str:
+    sm = SelfMonitor()
+    sm.link_prompt(prompt_sha, note_sha, relation)
+    return "ok"
+
 def _tool_math_eval(expr: str) -> str:
     import ast, operator as op
     allowed = {ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul, ast.Div: op.truediv, ast.Pow: op.pow,
@@ -695,6 +735,11 @@ def _tool_date_parse(text: str) -> str:
 TOOLS: Dict[str, Callable[..., str]] = {
     "memory.search":      lambda **kw: _tool_memory_search(str(kw.get("query","")), int(kw.get("limit",3))),
     "memory.note":        lambda **kw: _tool_memory_note(str(kw.get("text",""))),
+    "memory.link":        lambda **kw: _tool_memory_link(
+        str(kw.get("prompt_sha","")),
+        str(kw.get("note_sha","")),
+        str(kw.get("relation","")),
+    ),
     "math.eval":          lambda **kw: _tool_math_eval(str(kw.get("expr","0"))),
     "time.now":           lambda **kw: _tool_time_now(),
     "text.regex_extract": lambda **kw: _tool_text_regex_extract(str(kw.get("pattern","")), str(kw.get("text","")), int(kw.get("limit",10)), str(kw.get("flags",""))),
@@ -706,6 +751,7 @@ def _tools_manifest() -> str:
         "tools": {
             "memory.search":      {"args": {"query": "string", "limit": "int"}, "desc": "search previous prompts/answers/notes (redacted)."},
             "memory.note":        {"args": {"text": "string"}, "desc": "store a short note to memory."},
+            "memory.link":        {"args": {"prompt_sha": "string", "note_sha": "string", "relation": "string"}, "desc": "link a prompt to a note."},
             "math.eval":          {"args": {"expr": "string"}, "desc": "evaluate a safe arithmetic expression."},
             "time.now":           {"args": {}, "desc": "UTC timestamp now."},
             "text.regex_extract": {"args": {"pattern": "string", "text": "string", "limit":"int", "flags":"string"}, "desc": "regex matches as JSON list."},
