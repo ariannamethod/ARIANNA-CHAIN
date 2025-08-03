@@ -29,6 +29,9 @@ from rewards import format_reward, reasoning_steps_reward
 import requests
 import torch
 import torch.nn as nn
+from utils.quantization import apply_dynamic_quant
+
+QUANTIZE = False
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Core prompt (embedded persona)
@@ -849,6 +852,16 @@ def _similarity(a: str, b: str) -> float:
     cos = _tf_cosine(a, b)
     return max(seq, cos)
 
+
+def load_model(config: AriannaCConfig | None = None) -> AriannaC:
+    cfg = config or AriannaCConfig()
+    if QUANTIZE:
+        cfg.apply_quant = False
+    model = AriannaC(cfg)
+    if QUANTIZE:
+        model = apply_dynamic_quant(model)
+    return model
+
 # ────────────────────────────────────────────────────────────────────────────────
 # ReAct reasoning + checkpoint reflect + critical verify
 # ────────────────────────────────────────────────────────────────────────────────
@@ -989,13 +1002,13 @@ def reason_loop(
                 try:
                     candidates.append(call_liquid(ctx, trace_id=trace_id, temperature=t))
                 except Exception:
-                    model = AriannaC(AriannaCConfig())
+                    model = load_model()
                     idx = tokenizer.encode(ctx)
                     out = model.generate(idx, max_new_tokens=128)
                     candidates.append({"mode": "final", "think": "", "answer": tokenizer.decode(out[0]), "stop": True, "step": step_idx, "trace_id": trace_id, "confidence": 0.6})
                     break
         else:
-            model = AriannaC(AriannaCConfig())
+            model = load_model()
             idx = tokenizer.encode(ctx)
             out = model.generate(idx, max_new_tokens=128)
             candidates.append({"mode": "final", "think": "", "answer": tokenizer.decode(out[0]), "stop": True, "step": step_idx, "trace_id": trace_id, "confidence": 0.6})
@@ -1235,7 +1248,7 @@ def reflect(prompt: str, draft: str, *, use_liquid: bool = True, max_new_tokens:
         obj = call_liquid(critique_prompt, temperature=0.2)
         return str(obj.get("answer", "")) or json.dumps(obj, ensure_ascii=False)
     cfg = config or AriannaCConfig()
-    model = AriannaC(cfg)
+    model = load_model(cfg)
     idx = tokenizer.encode("Critique:\n" + critique_prompt)
     out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
     return tokenizer.decode(out[0])
@@ -1292,7 +1305,7 @@ def generate_text(
                 return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
             return text
         except Exception:
-            model = AriannaC(AriannaCConfig())
+            model = load_model()
             idx = tokenizer.encode(prompt)
             out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
             text = tokenizer.decode(out[0])
@@ -1310,7 +1323,7 @@ def generate_text(
             if log_reasoning:
                 return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
             return text
-    model = AriannaC(AriannaCConfig())
+    model = load_model()
     idx = tokenizer.encode(prompt)
     out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
     text = tokenizer.decode(out[0])
@@ -1377,9 +1390,12 @@ def main() -> None:
     parser.add_argument("--critical-every", type=int, default=3, help="run critical check every N steps")
     parser.add_argument("--beams", type=int, default=1, help="number of candidate beams per step")
     parser.add_argument("--beam-size", type=int, default=1, help="number of reasoning branches for tree search")
+    parser.add_argument("--quantize", action="store_true", help="apply dynamic quantization to the model")
     args = parser.parse_args()
 
     use_liquid = not args.no_liquid
+    global QUANTIZE
+    QUANTIZE = args.quantize
 
     if args.max_steps > 0:
         if args.beam_size > 1:
