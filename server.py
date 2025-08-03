@@ -16,6 +16,8 @@ from collections import OrderedDict
 from flask import Flask, request, jsonify, Response, make_response
 from openai import OpenAI
 
+from arianna_chain import estimate_complexity_and_entropy, thought_logger, SelfMonitor
+
 app = Flask(__name__)
 
 LOG_DIR = os.path.join("logs", "server")
@@ -42,8 +44,10 @@ SECRET               = os.getenv("ARIANNA_SERVER_TOKEN", "")
 MODEL_DEFAULT        = os.getenv("ARIANNA_MODEL", "gpt-4.1")
 MODEL_LIGHT          = os.getenv("ARIANNA_MODEL_LIGHT", MODEL_DEFAULT)
 MODEL_HEAVY          = os.getenv("ARIANNA_MODEL_HEAVY", MODEL_DEFAULT)
-HEAVY_TRIGGER_TOKENS = int(os.getenv("HEAVY_TRIGGER_TOKENS", "3500"))
-HEAVY_HINTS          = tuple(x.strip() for x in os.getenv("HEAVY_HINTS", "deep analysis;докажи;пошагово;reason;рефлексия").split(";") if x.strip())
+ENTROPY_HEAVY_THRESHOLD = float(os.getenv("ENTROPY_HEAVY_THRESHOLD", "0.7"))
+HISTORY_ENTROPY_THRESHOLD = float(os.getenv("HISTORY_ENTROPY_THRESHOLD", "0.75"))
+HISTORY_WINDOW       = int(os.getenv("HISTORY_ENTROPY_WINDOW", "5"))
+MODEL_PICK_FALLBACK  = os.getenv("MODEL_PICK_FALLBACK", MODEL_HEAVY)
 
 PROMPT_LIMIT_CHARS   = int(os.getenv("PROMPT_LIMIT_CHARS",   "16000"))
 CACHE_TTL            = int(os.getenv("CACHE_TTL_SECONDS",    "120"))
@@ -56,6 +60,8 @@ TIME_PING_SECONDS    = float(os.getenv("SSE_TIME_HEARTBEAT_SEC", "12"))
 TIME_SENSITIVE_HINTS = ("now", "today", "сейчас", "сегодня", "latest", "свеж", "текущ")
 CODE_BLOCK_LIMIT     = int(os.getenv("CODE_BLOCK_LIMIT", "65536"))
 SIMHASH_HAMMING_THR  = int(os.getenv("SIMHASH_HAMMING_THR", "3"))
+
+self_monitor = SelfMonitor()
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Авторизация (единый парсер токена)
@@ -284,16 +290,33 @@ def _truncate_large_code_blocks(text: str) -> str:
         return m.group(0)
     return pat.sub(repl, text)
 
-def _approx_tokens(text: str) -> int:
-    return max(1, len(text.encode("utf-8", "ignore")) // 4)
+def _recent_user_entropy(n: int) -> float:
+    try:
+        cur = self_monitor.conn.cursor()
+        cur.execute("SELECT output FROM logs ORDER BY ts DESC LIMIT ?", (n,))
+        rows = [r[0] for r in cur.fetchall()]
+    except Exception:
+        return 0.0
+    if not rows:
+        return 0.0
+    vals = [estimate_complexity_and_entropy(o)[1] for o in rows]
+    return sum(vals) / len(vals)
+
 
 def _pick_model(prompt: str, fallback: str) -> str:
-    t = _approx_tokens(prompt)
-    if t >= HEAVY_TRIGGER_TOKENS:
-        return MODEL_HEAVY
-    lo = prompt.lower()
-    if any(h in lo for h in HEAVY_HINTS):
-        return MODEL_HEAVY
+    try:
+        probe_obj, _, _ = _responses_create(prompt, model=MODEL_LIGHT, temperature=0.0, top_p=0.1)
+        probe_answer = probe_obj.get("answer", "")
+        tokens, entropy, _ = estimate_complexity_and_entropy(probe_answer)
+        thought_logger.log_turn(probe_answer, tokens, entropy)
+        self_monitor.log(prompt, probe_answer)
+        if entropy >= ENTROPY_HEAVY_THRESHOLD:
+            return MODEL_HEAVY
+        if _recent_user_entropy(HISTORY_WINDOW) >= HISTORY_ENTROPY_THRESHOLD:
+            return MODEL_HEAVY
+    except Exception as e:
+        app.logger.warning("model probe failed: %s", e)
+        return MODEL_PICK_FALLBACK or fallback
     return MODEL_LIGHT or fallback
 
 def _sanitize_prompt(prompt: str, limit: int = PROMPT_LIMIT_CHARS) -> str:

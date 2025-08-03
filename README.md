@@ -20,6 +20,20 @@ Inspired by Andrej Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT), th
 python arianna_chain.py "2+2="
 ```
 
+## Server Model Selection
+
+`server.py` dynamically switches between light and heavy models. Environment
+variables allow tuning this probe:
+
+- `ENTROPY_HEAVY_THRESHOLD` – entropy above this during the probe triggers the
+  heavy model (default `0.7`).
+- `HISTORY_ENTROPY_THRESHOLD` – average entropy of recent turns above this
+  selects the heavy model (default `0.75`).
+- `HISTORY_ENTROPY_WINDOW` – number of past turns considered for history
+  (default `5`).
+- `MODEL_PICK_FALLBACK` – model used if the probe fails (defaults to the heavy
+  model).
+
 ## Reasoning Logger
 
 The engine now keeps a running account of its own cognitive load. Each response is examined through a heuristic lens that gauges how tangled the thought felt and how varied the vocabulary spread itself across the page. This record grows quietly in the background and may be summoned when reflection is desired.
