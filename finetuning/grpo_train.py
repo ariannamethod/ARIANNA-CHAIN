@@ -31,13 +31,21 @@ logger.addHandler(_file_handler)
 logger.addHandler(_stream_handler)
 
 
-def load_dataset(path: str) -> List[Dict[str, str]]:
-    """Load a JSONL dataset with ``prompt``/``solution`` style entries."""
+def load_dataset(path: str, min_confidence: float = 0.0) -> List[Dict[str, str]]:
+    """Load a JSONL dataset and filter entries by confidence."""
     items: List[Dict[str, str]] = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            if line.strip():
-                items.append(json.loads(line))
+            if not line.strip():
+                continue
+            obj = json.loads(line)
+            conf = float(obj.get("confidence", 1.0))
+            if conf < min_confidence:
+                continue
+            prompt = obj.get("prompt") or obj.get("question") or ""
+            answer = obj.get("answer") or obj.get("solution") or ""
+            plan = obj.get("plan", "")
+            items.append({"prompt": prompt, "answer": answer, "plan": plan, "confidence": conf})
     return items
 
 
@@ -90,7 +98,7 @@ def sample_with_grad(
 
 
 def train(args: argparse.Namespace) -> None:
-    data = load_dataset(args.dataset)
+    data = load_dataset(args.dataset, args.min_confidence)
     model = load_model(args.model_path)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
@@ -149,6 +157,12 @@ def parse_args() -> argparse.Namespace:
         "--logdir",
         default=str(DEFAULT_LOGDIR),
         help="Directory for logs and checkpoints",
+    )
+    parser.add_argument(
+        "--min-confidence",
+        type=float,
+        default=0.0,
+        help="Ignore dataset entries with confidence below this threshold",
     )
     return parser.parse_args()
 
