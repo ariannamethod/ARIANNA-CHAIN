@@ -1,60 +1,64 @@
+# arianna_chain.py — клиент к серверу "liquid weights"
+# ReAct-граф + checkpoint-reflect + стагнация (cosine+text) + параллельные тулзы + критпроверка + verify-проход при low confidence
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import json
 import math
+import os
+import re
 import sqlite3
 import time
+import uuid
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import List, Tuple, Optional, Dict, Any, Iterable, Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import requests
 import torch
 import torch.nn as nn
-from tokenizers import Tokenizer
-from tokenizers.models import BPE
-from tokenizers.pre_tokenizers import ByteLevel
-from tokenizers.trainers import BpeTrainer
 
-# --- Tokenizer utilities ---
-_tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
-_tokenizer.pre_tokenizer = ByteLevel()
-trainer = BpeTrainer(special_tokens=["[UNK]"])
-CORE_PROMPT = (Path(__file__).resolve().parent / "core_prompt.txt").read_text(encoding="utf-8")
-print("core_prompt.txt loaded [OK]")
-_tokenizer.train_from_iterator([CORE_PROMPT], trainer)
+# ────────────────────────────────────────────────────────────────────────────────
+# Core prompt (ленивая загрузка)
+# ────────────────────────────────────────────────────────────────────────────────
+def _load_core_prompt() -> str:
+    try:
+        p = Path(__file__).resolve().parent / "core_prompt.txt"
+        return p.read_text(encoding="utf-8")
+    except Exception:
+        return (
+            "You are Arianna planner. Think step-by-step using modes plan/act/reflect/final. "
+            "Allowed transitions: plan→act→reflect→plan|final. "
+            "When you want to use a tool, set mode='act' and fill action {name,args} from TOOLS manifest. "
+            "Return STRICT JSON with keys: trace_id, step, mode, think, answer, stop, confidence, halt_reason?, "
+            "action?, observation?, controls?, tokens_used?."
+        )
 
+CORE_PROMPT = _load_core_prompt()
+print("core_prompt.txt loaded [OK]" if CORE_PROMPT else "core_prompt.txt missing, using fallback")
 
-class TokenizerWrapper:
-    """Light wrapper around ``tokenizers.Tokenizer`` providing torch helpers."""
-
-    def __init__(self, tk: Tokenizer):
-        self._tk = tk
-
-    @property
-    def vocab_size(self) -> int:
-        return self._tk.get_vocab_size()
-
+# ────────────────────────────────────────────────────────────────────────────────
+# Byte tokenizer
+# ────────────────────────────────────────────────────────────────────────────────
+class ByteTokenizer:
+    vocab_size: int = 256
     def encode(self, text: str) -> torch.Tensor:
-        """Encode ``text`` into a tensor of token ids."""
-        ids = self._tk.encode(text).ids
-        return torch.tensor([ids], dtype=torch.long)
-
+        arr = list(text.encode("utf-8", errors="replace"))
+        return torch.tensor([arr], dtype=torch.long)
     def decode(self, tokens: torch.Tensor) -> str:
-        """Decode token ids back into a string."""
-        ids = tokens.squeeze().tolist()
-        return self._tk.decode(ids)
+        arr = [int(x) for x in tokens.reshape(-1).tolist()]
+        return bytes(arr).decode("utf-8", errors="replace")
 
+tokenizer = ByteTokenizer()
 
-# Public tokenizer instance
-
-tokenizer = TokenizerWrapper(_tokenizer)
-
-
-# --- Thought complexity logger ---
+# ────────────────────────────────────────────────────────────────────────────────
+# Complexity / entropy лог
+# ────────────────────────────────────────────────────────────────────────────────
 @dataclass
 class ThoughtLogEntry:
     timestamp: str
@@ -62,167 +66,138 @@ class ThoughtLogEntry:
     complexity: int
     entropy: float
 
-
 class ThoughtComplexityLogger:
-    """Track complexity and entropy of generated thoughts."""
-
     def __init__(self, log_file: str | Path = "logs/thought_log.jsonl") -> None:
         self.log_file = Path(log_file)
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
         self.logs: List[ThoughtLogEntry] = []
-
     def log_turn(self, message: str, complexity_scale: int, entropy: float) -> ThoughtLogEntry:
         entry = ThoughtLogEntry(
             timestamp=datetime.utcnow().isoformat() + "Z",
             message=message,
             complexity=max(1, min(5, complexity_scale)),
-            entropy=float(min(1.0, entropy)),
+            entropy=float(min(1.0, max(0.0, entropy))),
         )
         self.logs.append(entry)
         with self.log_file.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry.__dict__) + "\n")
+            f.write(json.dumps(entry.__dict__, ensure_ascii=False) + "\n")
         return entry
-
     def recent(self, n: int = 7) -> List[ThoughtLogEntry]:
         return self.logs[-n:]
-
 
 def estimate_complexity_and_entropy(message: str) -> tuple[int, float]:
     complexity = 1
     lowered = message.lower()
-    if any(keyword in lowered for keyword in ["why", "paradox", "recursive"]):
+    if any(k in lowered for k in ("why", "почему", "paradox", "recursive", "<think>", "plan", "reflect")):
         complexity += 2
     if len(message) > 300:
         complexity += 1
     complexity = max(1, min(5, complexity))
     unique_words = len(set(message.split()))
-    entropy = min(1.0, unique_words / 40)
+    entropy = min(1.0, unique_words / 40.0)
     return complexity, entropy
-
 
 thought_logger = ThoughtComplexityLogger()
 
-
-# --- 2-bit quantization ---
+# ────────────────────────────────────────────────────────────────────────────────
+# 2-bit quant (toy)
+# ────────────────────────────────────────────────────────────────────────────────
 @torch.no_grad()
 def quantize_2bit(model: nn.Module) -> None:
-    """Quantize the model weights to 2-bit precision in-place."""
-    for param in model.parameters():
-        if param.dtype not in (torch.float32, torch.float64):
+    for p in model.parameters():
+        if not p.is_floating_point():
             continue
-        max_val = param.abs().max()
+        max_val = p.detach().abs().max()
         if max_val == 0:
             continue
-        scale = max_val / 3
-        q = (param / scale).round().clamp(-3, 3)
+        scale = max_val / 3.0
+        q = (p / scale).round().clamp(-3, 3)
         signs = torch.sign(q)
-        mags = torch.where(
-            q.abs() > 2,
-            torch.tensor(3.0, device=param.device),
-            torch.tensor(1.0, device=param.device),
-        )
-        param.copy_(signs * mags * scale)
+        mags = torch.where(q.abs() > 2, torch.tensor(3.0, device=p.device), torch.tensor(1.0, device=p.device))
+        p.copy_(signs * mags * scale)
 
-
-# --- Self-monitoring database ---
+# ────────────────────────────────────────────────────────────────────────────────
+# Self-monitor sqlite (+ notes)
+# ────────────────────────────────────────────────────────────────────────────────
 class SelfMonitor:
-    """Record code snapshots and generation events."""
-
+    _snapshotted = False
     def __init__(self, db_path: str = "arianna_memory.sqlite"):
         self.conn = sqlite3.connect(db_path)
         self._init_db()
-        self.snapshot_codebase()
-
+        if not SelfMonitor._snapshotted:
+            self.snapshot_codebase()
+            SelfMonitor._snapshotted = True
     def _init_db(self) -> None:
         cur = self.conn.cursor()
-        cur.execute(
-            "CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, content BLOB, sha256 TEXT)"
-        )
-        cur.execute(
-            "CREATE TABLE IF NOT EXISTS logs(ts REAL, prompt TEXT, output TEXT, sha256 TEXT)"
-        )
-        cur.execute(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS prompts_index USING fts5(prompt, output)"
-        )
+        cur.execute("CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, content BLOB, sha256 TEXT)")
+        cur.execute("CREATE TABLE IF NOT EXISTS logs(ts REAL, prompt TEXT, output TEXT, sha256 TEXT)")
+        cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS prompts_index USING fts5(prompt, output)")
+        cur.execute("CREATE TABLE IF NOT EXISTS notes(ts REAL, text TEXT)")
+        cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS notes_index USING fts5(text)")
         self.conn.commit()
-
     def snapshot_codebase(self, root: str | Path = ".") -> None:
-        """Store all files in the repository with their hashes."""
         root_path = Path(root)
+        SKIP_DIRS = {".git", "__pycache__", "venv", "env", "logs", "node_modules", ".pytest_cache"}
+        SKIP_SUFFIXES = {".sqlite", ".db", ".pdf", ".bin", ".pt", ".pth", ".zip", ".tar", ".png", ".jpg", ".jpeg", ".env", ".toml", ".yaml", ".yml"}
         for path in root_path.rglob("*"):
-            if not path.is_file():
-                continue
-            if path.name == "arianna_memory.sqlite":
-                continue
-            data = path.read_bytes()
+            if not path.is_file(): continue
+            if any(part in SKIP_DIRS for part in path.parts): continue
+            if path.suffix.lower() in SKIP_SUFFIXES: continue
+            try: data = path.read_bytes()
+            except Exception: continue
+            if len(data) > 2_000_000: continue
             sha = hashlib.sha256(data).hexdigest()
             cur = self.conn.cursor()
-            cur.execute(
-                "INSERT OR REPLACE INTO files(path, content, sha256) VALUES (?,?,?)",
-                (str(path), sqlite3.Binary(data), sha),
-            )
+            cur.execute("INSERT OR REPLACE INTO files(path, content, sha256) VALUES (?,?,?)", (str(path), sqlite3.Binary(data), sha))
         self.conn.commit()
-
     def log(self, prompt: str, output: str) -> None:
-        """Log a generation event with timestamp."""
-        sha = hashlib.sha256(prompt.encode()).hexdigest()
+        sha = hashlib.sha256(prompt.encode("utf-8", errors="ignore")).hexdigest()
         cur = self.conn.cursor()
-        cur.execute(
-            "INSERT INTO logs(ts, prompt, output, sha256) VALUES (?,?,?,?)",
-            (time.time(), prompt, output, sha),
-        )
-        cur.execute(
-            "INSERT INTO prompts_index(prompt, output) VALUES (?,?)",
-            (prompt, output),
-        )
+        cur.execute("INSERT INTO logs(ts, prompt, output, sha256) VALUES (?,?,?,?)", (time.time(), prompt, output, sha))
+        cur.execute("INSERT INTO prompts_index(prompt, output) VALUES (?,?)", (prompt, output))
         self.conn.commit()
-
+    def note(self, text: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute("INSERT INTO notes(ts, text) VALUES (?, ?)", (time.time(), text))
+        cur.execute("INSERT INTO notes_index(text) VALUES (?)", (text,))
+        self.conn.commit()
     def _search_tfidf(self, query: str, limit: int = 5) -> list[tuple[str, str]]:
         cur = self.conn.cursor()
-        cur.execute(
-            "SELECT prompt, output FROM prompts_index WHERE prompts_index MATCH ? "
-            "ORDER BY bm25(prompts_index) LIMIT ?",
-            (query, limit),
-        )
+        cur.execute("SELECT prompt, output FROM prompts_index WHERE prompts_index MATCH ? ORDER BY bm25(prompts_index) LIMIT ?", (query, limit))
         return cur.fetchall()
-
-    def search(self, prompt: str, limit: int = 5) -> list[tuple[str, str]]:
-        """Return top-k similar prompt/output pairs.
-
-        Exact SHA-256 matches are preferred; otherwise a TF-IDF lookup is used.
-        """
-        sha = hashlib.sha256(prompt.encode()).hexdigest()
+    def _search_notes(self, query: str, limit: int = 5) -> list[str]:
         cur = self.conn.cursor()
-        cur.execute(
-            "SELECT prompt, output FROM logs WHERE sha256 = ? LIMIT ?",
-            (sha, limit),
-        )
+        cur.execute("SELECT text FROM notes_index WHERE notes_index MATCH ? ORDER BY bm25(notes_index) LIMIT ?", (query, limit))
+        return [r[0] for r in cur.fetchall()]
+    def search(self, prompt: str, limit: int = 5) -> list[tuple[str, str]]:
+        sha = hashlib.sha256(prompt.encode("utf-8", errors="ignore")).hexdigest()
+        cur = self.conn.cursor()
+        cur.execute("SELECT prompt, output FROM logs WHERE sha256 = ? LIMIT ?", (sha, limit))
         rows = cur.fetchall()
-        if rows:
-            return rows
-        return self._search_tfidf(prompt, limit=limit)
+        return rows or self._search_tfidf(prompt, limit=limit)
+    def search_prompts_and_notes(self, query: str, limit: int = 5) -> list[str]:
+        prs = self._search_tfidf(query, limit=limit)
+        nts = self._search_notes(query, limit=limit)
+        out = []
+        for p, o in prs:
+            p1 = p.strip().splitlines()[0][:160]
+            o1 = o.strip().splitlines()[0][:200]
+            out.append(f"Q:{p1} | A:{o1}")
+        out.extend(nts)
+        return out[:limit]
 
-    def search_prompts(self, query: str, limit: int = 5) -> list[tuple[str, str]]:
-        """Search previously logged prompts similar to the query."""
-        return self._search_tfidf(query, limit=limit)
-
-
-# --- Model definition ---
+# ────────────────────────────────────────────────────────────────────────────────
+# Mini GPT (toy CPU fallback)
+# ────────────────────────────────────────────────────────────────────────────────
 @dataclass
 class AriannaCConfig:
-    """Configuration for the Arianna-C transformer."""
-
     block_size: int = 1024
-    vocab_size: int | None = None
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
+    vocab_size: int = tokenizer.vocab_size
+    n_layer: int = 8
+    n_head: int = 8
+    n_embd: int = 512
     dropout: float = 0.0
-
-    def __post_init__(self) -> None:
-        if self.vocab_size is None:
-            self.vocab_size = tokenizer.vocab_size
-
+    apply_quant: bool = True
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config: AriannaCConfig):
@@ -238,39 +213,33 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = config.n_embd // config.n_head
         self.register_buffer(
             "bias",
-            torch.tril(torch.ones(config.block_size, config.block_size)).view(
-                1, 1, config.block_size, config.block_size
-            ),
+            torch.tril(torch.ones(config.block_size, config.block_size)).view(1,1,config.block_size,config.block_size),
             persistent=False,
         )
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, C = x.size()
-        k = self.key(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        q = self.query(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        v = self.value(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
+        B,T,C = x.size()
+        k = self.key(x).view(B,T,self.n_head,self.head_dim).transpose(1,2)
+        q = self.query(x).view(B,T,self.n_head,self.head_dim).transpose(1,2)
+        v = self.value(x).view(B,T,self.n_head,self.head_dim).transpose(1,2)
+        att = (q @ k.transpose(-2,-1)) * (1.0 / math.sqrt(self.head_dim))
         att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
         att = torch.softmax(att, dim=-1)
         att = self.attn_dropout(att)
         y = att @ v
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = y.transpose(1,2).contiguous().view(B,T,C)
         y = self.resid_dropout(self.proj(y))
         return y
-
 
 class MLP(nn.Module):
     def __init__(self, config: AriannaCConfig):
         super().__init__()
-        self.fc = nn.Linear(config.n_embd, 4 * config.n_embd)
-        self.proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.fc = nn.Linear(config.n_embd, 4*config.n_embd)
+        self.proj = nn.Linear(4*config.n_embd, config.n_embd)
         self.dropout = nn.Dropout(config.dropout)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = torch.nn.functional.gelu(self.fc(x))
         x = self.proj(x)
         return self.dropout(x)
-
 
 class Block(nn.Module):
     def __init__(self, config: AriannaCConfig):
@@ -279,16 +248,12 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.ln1(x))
         x = x + self.mlp(self.ln2(x))
         return x
 
-
 class AriannaC(nn.Module):
-    """A minimal GPT-style model inspired by nanoGPT."""
-
     def __init__(self, config: AriannaCConfig):
         super().__init__()
         self.config = config
@@ -299,11 +264,14 @@ class AriannaC(nn.Module):
         self.ln_f = nn.LayerNorm(config.n_embd)
         self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.block_size = config.block_size
-
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        B, T = idx.size()
+        self.eval()
+        torch.set_grad_enabled(False)
+        if self.config.apply_quant:
+            quantize_2bit(self)
+    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None):
+        B,T = idx.size()
         if T > self.block_size:
-            raise ValueError("Cannot forward, sequence too long")
+            raise ValueError("seq too long")
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device).unsqueeze(0)
         tok_emb = self.token_embedding(idx)
         pos_emb = self.position_embedding(pos)
@@ -314,238 +282,655 @@ class AriannaC(nn.Module):
         logits = self.head(x)
         loss = None
         if targets is not None:
-            loss = torch.nn.functional.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1)
-            )
+            loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
-
     @torch.no_grad()
-    def generate(self, idx: torch.Tensor, max_new_tokens: int) -> torch.Tensor:
+    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 0.0, top_k: int = 0, seed: int | None = None):
+        if seed is not None:
+            torch.manual_seed(seed)
         for _ in range(max_new_tokens):
-            logits, _ = self(idx[:, -self.block_size :])
+            logits,_ = self(idx[:, -self.block_size:])
             logits = logits[:, -1, :]
-            probs = torch.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
+            if temperature <= 0:
+                idx_next = torch.argmax(logits, dim=-1, keepdim=True)
+            else:
+                logits = logits / temperature
+                if top_k and top_k < logits.size(-1):
+                    v, ix = torch.topk(logits, top_k)
+                    probs = torch.zeros_like(logits).scatter_(1, ix, torch.softmax(v, dim=-1))
+                else:
+                    probs = torch.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
 
+# ────────────────────────────────────────────────────────────────────────────────
+# HTTP к Liquid-серверу
+# ────────────────────────────────────────────────────────────────────────────────
+def _srv() -> str:      return os.getenv("ARIANNA_SERVER_URL", "http://127.0.0.1:8000/generate")
+def _srv_sse() -> str:  return os.getenv("ARIANNA_SERVER_SSE_URL", "http://127.0.0.1:8000/generate_sse")
+def _token() -> Optional[str]: return os.getenv("ARIANNA_SERVER_TOKEN")
 
-# --- Reflection utility ---
-def reflect(prompt: str, draft: str, max_new_tokens: int = 50, config: AriannaCConfig | None = None) -> str:
-    """Critique a draft answer using the model."""
-    critique_prompt = (
-        "Provide feedback on the given answer. "
-        f"Prompt: {prompt}\nAnswer: {draft}\nCritique:"
+class _HTTP:
+    def __init__(self, timeout: float = 60.0):
+        self.sess = requests.Session()
+        self.timeout = timeout
+        self.sess.headers.update({"Content-Type": "application/json"})
+        if _token():
+            self.sess.headers["Authorization"] = f"Bearer {_token()}"
+    def post_json(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        base = 0.35
+        last_exc = None
+        for i in range(3):
+            try:
+                r = self.sess.post(url, json=payload, timeout=self.timeout)
+                if r.status_code == 429:
+                    retry_after = r.headers.get("Retry-After")
+                    try:
+                        sleep_s = float(retry_after) if retry_after else (base * (2 ** i))
+                    except Exception:
+                        sleep_s = base * (2 ** i)
+                    time.sleep(sleep_s)
+                    continue
+                r.raise_for_status()
+                return r.json()
+            except Exception as e:
+                last_exc = e
+                time.sleep(base * (2 ** i) + 0.2)
+        raise last_exc  # type: ignore[misc]
+    def stream_sse(self, url: str, payload: Dict[str, Any]):
+        if _token():
+            self.sess.headers["Authorization"] = f"Bearer {_token()}"
+        r = self.sess.post(url, json=payload, timeout=self.timeout, stream=True)
+        r.raise_for_status()
+        return r.iter_lines(decode_unicode=True)
+
+_http = _HTTP(timeout=90.0)
+
+def call_liquid(prompt: str, *, temperature: Optional[float] = None, top_p: Optional[float] = None,
+                timeout: float = 60.0, trace_id: Optional[str] = None) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"prompt": prompt}
+    if temperature is not None: payload["temperature"] = float(temperature)
+    if top_p is not None:       payload["top_p"] = float(top_p)
+    if trace_id:                payload["trace_id"] = trace_id
+    url = _srv()
+    _http.timeout = timeout
+    data = _http.post_json(url, payload)
+    resp = data.get("response", data)
+    if not isinstance(resp, dict):
+        return {"mode": "final", "think": "", "answer": str(resp), "stop": True, "step": 1, "confidence": 0.5, "halt_reason": "error"}
+    return resp
+
+def call_liquid_stream(prompt: str, *, temperature: Optional[float] = None, top_p: Optional[float] = None, timeout: float = 60.0) -> Iterable[Tuple[str, Dict[str, Any] | None]]:
+    """
+    Возвращает пары (event_type, data_dict). Событие и data «склеены»:
+      - ("response.output_text.delta", {"delta": "..."})
+      - ("response.completed", {...})
+      - ("ping", {})
+      - ("response.error", {"error": "..."})
+    """
+    payload: Dict[str, Any] = {"prompt": prompt}
+    if temperature is not None: payload["temperature"] = float(temperature)
+    if top_p is not None:       payload["top_p"] = float(top_p)
+    url = _srv_sse()
+    _http.timeout = timeout
+    current_event = "message"
+    for line in _http.stream_sse(url, payload):
+        if not line:
+            continue
+        if line.startswith("event:"):
+            current_event = line.split("event:", 1)[1].strip()
+            continue
+        if line.startswith("data:"):
+            data_raw = line.split("data:", 1)[1].strip()
+            try:
+                data = json.loads(data_raw)
+            except Exception:
+                data = {"raw": data_raw}
+            yield (current_event, data)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Tools (safe & redacted) + manifest
+# ────────────────────────────────────────────────────────────────────────────────
+_SECRET_PATTERNS = [
+    re.compile(r"sk-[A-Za-z0-9]{20,}"),
+    re.compile(r"(?i)(api[_-]?key|token)[\"'\s:]*[A-Za-z0-9\-_]{16,}"),
+    re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"),  # JWT-ish
+]
+
+def _redact(text: str) -> str:
+    red = text
+    for pat in _SECRET_PATTERNS:
+        red = pat.sub("[REDACTED]", red)
+    red = re.sub(r"[A-Za-z0-9+/]{200,}={0,2}", "[BASE64_REDACTED]", red)
+    return red
+
+def _tool_memory_search(query: str, limit: int = 3) -> str:
+    sm = SelfMonitor()
+    hits = sm.search_prompts_and_notes(query, limit=limit)
+    if not hits:
+        return "(no hits)"
+    out = [f"- { _redact(h) }" for h in hits]
+    return "\n".join(out)
+
+def _tool_memory_note(text: str) -> str:
+    sm = SelfMonitor()
+    sm.note(_redact(text)[:1000])
+    return "ok"
+
+def _tool_math_eval(expr: str) -> str:
+    import ast, operator as op
+    allowed = {ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul, ast.Div: op.truediv, ast.Pow: op.pow,
+               ast.USub: op.neg, ast.Mod: op.mod, ast.FloorDiv: op.floordiv}
+    def eval_(node):
+        if isinstance(node, ast.Num): return node.n
+        if isinstance(node, ast.UnaryOp) and type(node.op) in allowed: return allowed[type(node.op)](eval_(node.operand))
+        if isinstance(node, ast.BinOp) and type(node.op) in allowed: return allowed[type(node.op)](eval_(node.left), eval_(node.right))
+        raise ValueError("unsupported expression")
+    if "**" in expr and "e" in expr.lower():
+        raise ValueError("disallowed form")
+    node = ast.parse(expr, mode="eval").body
+    result = eval_(node)
+    if isinstance(result, (int, float)) and abs(result) > 1e12:
+        raise ValueError("result too large")
+    return str(result)
+
+def _tool_time_now() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+def _tool_text_regex_extract(pattern: str, text: str, limit: int = 10, flags: str = "") -> str:
+    fl = 0
+    if "i" in flags: fl |= re.IGNORECASE
+    if "m" in flags: fl |= re.MULTILINE
+    if "s" in flags: fl |= re.DOTALL
+    try:
+        rgx = re.compile(pattern, fl)
+        matches = rgx.findall(text)
+        if isinstance(matches, list):
+            matches = matches[:max(1, min(limit, 50))]
+            flat = []
+            for m in matches:
+                if isinstance(m, tuple):
+                    flat.append("".join(map(str, m)))
+                else:
+                    flat.append(str(m))
+            uniq, seen = [], set()
+            for x in flat:
+                if x not in seen:
+                    seen.add(x)
+                    uniq.append(x)
+            return json.dumps(uniq, ensure_ascii=False)
+        return "[]"
+    except Exception as e:
+        return json.dumps({"ok": False, "error": str(e)})
+
+def _tool_date_parse(text: str) -> str:
+    text = text.strip()
+    fmts = ["%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"]
+    for f in fmts:
+        try:
+            dt = datetime.strptime(text, f)
+            return dt.date().isoformat()
+        except Exception:
+            continue
+    try:
+        return datetime.fromisoformat(text).date().isoformat()
+    except Exception:
+        return json.dumps({"ok": False, "error": "unrecognized date"})
+
+TOOLS: Dict[str, Callable[..., str]] = {
+    "memory.search":      lambda **kw: _tool_memory_search(str(kw.get("query","")), int(kw.get("limit",3))),
+    "memory.note":        lambda **kw: _tool_memory_note(str(kw.get("text",""))),
+    "math.eval":          lambda **kw: _tool_math_eval(str(kw.get("expr","0"))),
+    "time.now":           lambda **kw: _tool_time_now(),
+    "text.regex_extract": lambda **kw: _tool_text_regex_extract(str(kw.get("pattern","")), str(kw.get("text","")), int(kw.get("limit",10)), str(kw.get("flags",""))),
+    "date.parse":         lambda **kw: _tool_date_parse(str(kw.get("text",""))),
+}
+
+def _tools_manifest() -> str:
+    return json.dumps({
+        "tools": {
+            "memory.search":      {"args": {"query": "string", "limit": "int"}, "desc": "search previous prompts/answers/notes (redacted)."},
+            "memory.note":        {"args": {"text": "string"}, "desc": "store a short note to memory."},
+            "math.eval":          {"args": {"expr": "string"}, "desc": "evaluate a safe arithmetic expression."},
+            "time.now":           {"args": {}, "desc": "UTC timestamp now."},
+            "text.regex_extract": {"args": {"pattern": "string", "text": "string", "limit":"int", "flags":"string"}, "desc": "regex matches as JSON list."},
+            "date.parse":         {"args": {"text": "string"}, "desc": "parse common date formats to ISO date."}
+        }
+    }, ensure_ascii=False)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Token budget + summarization
+# ────────────────────────────────────────────────────────────────────────────────
+def _approx_tokens(text: str) -> int:
+    return max(1, len(text.encode("utf-8", errors="ignore")) // 4)
+
+MAX_INPUT_TOKENS = int(os.getenv("ARIANNA_MAX_TOKENS", "3000"))
+LAST_USAGE_SUMMARIZE_THRESHOLD = int(os.getenv("ARIANNA_LAST_USAGE_SUMMARY_TOKENS", "8000"))
+
+def _summarize_trace(trace_text: str, *, trace_id: str) -> str:
+    prompt = (
+        "Summarize the following reasoning trace into <= 6 bullets capturing goals, constraints, used tools, "
+        "observations, pending TODO, and assumptions/limits. Return JSON with 'mode':'reflect', 'answer': summary, 'stop': false.\n\nTRACE:\n" + trace_text
     )
-    config = config or AriannaCConfig()
-    model = AriannaC(config)
-    quantize_2bit(model)
-    model.eval()
-    idx = tokenizer.encode(critique_prompt)
-    out = model.generate(idx, max_new_tokens=max_new_tokens)
-    critique = tokenizer.decode(out[0])
-    return critique
+    obj = call_liquid(prompt, trace_id=trace_id, temperature=0.2)
+    return str(obj.get("answer", ""))[:2000]
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Similarity helpers (без внешних зависимостей)
+# ────────────────────────────────────────────────────────────────────────────────
+def _tf_cosine(a: str, b: str) -> float:
+    def norm_tokens(s: str) -> List[str]:
+        return re.findall(r"[A-Za-zА-Яа-яёЁ0-9]{2,}", s.lower())
+    ca = Counter(norm_tokens(a))
+    cb = Counter(norm_tokens(b))
+    if not ca or not cb:
+        return 0.0
+    dot = sum(ca[t] * cb.get(t, 0) for t in ca)
+    na = math.sqrt(sum(v*v for v in ca.values()))
+    nb = math.sqrt(sum(v*v for v in cb.values()))
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
 
-# --- Text generation utilities ---
-def generate_text(
-    prompt: str | None = None,
-    max_new_tokens: int = 50,
-    config: AriannaCConfig | None = None,
+def _similarity(a: str, b: str) -> float:
+    seq = difflib.SequenceMatcher(None, a, b).ratio()
+    cos = _tf_cosine(a, b)
+    return max(seq, cos)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# ReAct reasoning + checkpoint reflect + critical verify
+# ────────────────────────────────────────────────────────────────────────────────
+_ALLOWED_TRANSITIONS = {
+    "plan": {"act"},
+    "act": {"reflect"},
+    "reflect": {"plan", "final"},
+    "final": set(),
+}
+
+def _normalize_step_text(step_obj: Dict[str, Any]) -> str:
+    return (step_obj.get("think","") + " | " + step_obj.get("answer","")).strip()
+
+def _force_action_from_text(answer: str) -> Dict[str, Any]:
+    words = re.findall(r"[A-Za-zА-Яа-яёЁ]{3,}", answer)[:8]
+    query = " ".join(words)
+    return {"name": "memory.search", "args": {"query": query, "limit": 3}}
+
+def _critical_check(trace_id: str, steps: List[Dict[str, Any]], user_prompt: str) -> str:
+    ctx = "\n".join(json.dumps(s, ensure_ascii=False) for s in steps[-3:])
+    prompt = (
+        "Analyze for contradictions, leaps in logic, or missing facts in the following trace. "
+        "Return JSON with mode='reflect', stop=false, answer with max 3 bullets: "
+        "(1) potential flaw (2) what to verify (3) next concrete action.\n\nTRACE:\n" + ctx +
+        "\n\nUSER PROMPT:\n" + user_prompt
+    )
+    obj = call_liquid(prompt, trace_id=trace_id, temperature=0.0)
+    return str(obj.get("answer", ""))
+
+def _verify_low_confidence(trace_id: str, user_prompt: str, draft: str) -> str:
+    crit = (
+        "Critique the following draft for factual errors, contradictions and missing steps. "
+        "Then propose a corrected version. Return JSON with mode='reflect', stop=false, answer=ONLY corrected text.\n"
+        f"PROMPT:\n{user_prompt}\n\nDRAFT:\n{draft}"
+    )
+    obj = call_liquid(crit, trace_id=trace_id, temperature=0.2)
+    return str(obj.get("answer", draft))
+
+def reason_loop(
+    prompt: Optional[str] = None,
     *,
-    log_reasoning: bool = False,
+    max_steps: int = 6,
+    use_liquid: bool = True,
+    progress_patience: int = 2,
+    base_temperature: float = 0.3,
+    checkpoint_every: int = 2,
+    critical_every: int = 3,
+) -> str:
+    user_prompt = (prompt or CORE_PROMPT).strip()
+    sm = SelfMonitor()
+    trace_id = uuid.uuid4().hex
+    steps: List[Dict[str, Any]] = []
+    stagnation = 0
+    final_answer = ""
+    temperature = base_temperature
+
+    def render_context(expected_next: str = "") -> str:
+        lines = [
+            "=== SYSTEM INSTRUCTION ===",
+            CORE_PROMPT,
+            "=== TOOLS (name -> args schema) ===",
+            _tools_manifest(),
+            "=== TRACE (latest first) ===",
+        ]
+        for s in reversed(steps[-6:]):
+            lines.append(json.dumps(s, ensure_ascii=False))
+        lines.append("=== USER PROMPT ===")
+        lines.append(user_prompt)
+        if expected_next:
+            lines.append(f"=== MODE HINT ===\nExpected next step: {expected_next}")
+        ctx = "\n".join(lines)
+        ctx = re.sub(r"[A-Za-z0-9+/]{200,}={0,2}", "[BASE64_REDACTED]", ctx)
+        return ctx
+
+    def ensure_budget(ctx: str):
+        if steps and isinstance(steps[-1].get("tokens_used"), dict):
+            last_total = int(steps[-1]["tokens_used"].get("total", 0))
+            if last_total > LAST_USAGE_SUMMARIZE_THRESHOLD:
+                full = "\n".join(json.dumps(s, ensure_ascii=False) for s in steps)
+                summary = _summarize_trace(full, trace_id=trace_id)
+                steps.clear()
+                steps.append({"trace_id": trace_id, "step": 0, "mode": "reflect", "think": "summary", "answer": summary, "stop": False, "meta": {"summarized": True}})
+                return
+        if _approx_tokens(ctx) <= MAX_INPUT_TOKENS:
+            return
+        full = "\n".join(json.dumps(s, ensure_ascii=False) for s in steps)
+        summary = _summarize_trace(full, trace_id=trace_id)
+        steps.clear()
+        steps.append({"trace_id": trace_id, "step": 0, "mode": "reflect", "think": "summary", "answer": summary, "stop": False, "meta": {"summarized": True}})
+
+    for step_idx in range(1, max_steps + 1):
+        if checkpoint_every and step_idx > 1 and (step_idx - 1) % checkpoint_every == 0 and steps:
+            try:
+                chk = {
+                    "trace_id": trace_id, "step": (steps[-1]["step"] + 1 if steps else 1),
+                    "mode": "reflect", "think": "checkpoint",
+                    "answer": _critical_check(trace_id, steps, user_prompt),
+                    "stop": False, "confidence": 0.7
+                }
+                sm.log("<step>", json.dumps(chk, ensure_ascii=False))
+                steps.append(chk)
+            except Exception:
+                pass
+
+        temperature = max(0.3, min(0.9, base_temperature + 0.2 * stagnation))
+        expected_next = "act" if (steps and steps[-1]["mode"] == "plan") else ""
+
+        ctx = render_context(expected_next)
+        ensure_budget(ctx)
+
+        if use_liquid:
+            obj = call_liquid(ctx, trace_id=trace_id, temperature=temperature)
+        else:
+            model = AriannaC(AriannaCConfig())
+            idx = tokenizer.encode(ctx)
+            out = model.generate(idx, max_new_tokens=128, temperature=0.0)
+            obj = {"mode": "final", "think": "", "answer": tokenizer.decode(out[0]), "stop": True, "step": step_idx, "trace_id": trace_id, "confidence": 0.6}
+
+        mode = str(obj.get("mode", "final"))
+        think = str(obj.get("think", ""))
+        answer = str(obj.get("answer", ""))
+        stop = bool(obj.get("stop", mode == "final"))
+        conf = float(obj.get("confidence", 0.7))
+        act = obj.get("action") if isinstance(obj.get("action"), dict) or isinstance(obj.get("action"), list) else None
+        observation: Optional[str] = None
+
+        if mode == "final" and conf < 0.6 and step_idx < max_steps:
+            mode = "reflect"
+            stop = False
+
+        if mode in ("plan", "reflect") and act is None and stagnation >= 1:
+            act = _force_action_from_text(answer)
+            mode = "act"
+            stop = False
+
+        if mode == "act" and act:
+            try:
+                if isinstance(act, list):
+                    results = []
+                    with ThreadPoolExecutor(max_workers=min(4, len(act))) as ex:
+                        futs = []
+                        for a in act:
+                            if not (isinstance(a, dict) and isinstance(a.get("name"), str)):
+                                continue
+                            name = a["name"]
+                            args = a.get("args", {}) if isinstance(a.get("args"), dict) else {}
+                            tool = TOOLS.get(name)
+                            futs.append(ex.submit(lambda t=tool, kw=args, n=name: (n, t(**kw) if t else f"(unknown tool: {n})")))
+                        for f in as_completed(futs):
+                            name, res = f.result()
+                            if isinstance(res, (dict, list)):
+                                res = json.dumps(res, ensure_ascii=False)
+                            results.append({"tool": name, "result": str(res)})
+                    observation = json.dumps(results, ensure_ascii=False)
+                else:
+                    name = act["name"]
+                    args = act.get("args", {}) if isinstance(act.get("args"), dict) else {}
+                    tool = TOOLS.get(name)
+                    obs_res = tool(**args) if tool else f"(unknown tool: {name})"
+                    if isinstance(obs_res, (dict, list)):
+                        observation = json.dumps(obs_res, ensure_ascii=False)
+                    else:
+                        observation = str(obs_res)
+            except Exception as e:
+                observation = json.dumps({"ok": False, "error": str(e)})
+
+        step_obj: Dict[str, Any] = {
+            "trace_id": trace_id, "step": step_idx, "mode": mode,
+            "think": think, "answer": answer, "stop": stop, "confidence": conf
+        }
+        if isinstance(obj.get("tokens_used"), dict):
+            step_obj["tokens_used"] = obj["tokens_used"]
+        if act: step_obj["action"] = act
+        if observation: step_obj["observation"] = observation
+
+        sm.log("<step>", json.dumps(step_obj, ensure_ascii=False))
+        steps.append(step_obj)
+        if answer:
+            final_answer = answer
+
+        if len(steps) >= 2:
+            s_prev = _normalize_step_text(steps[-2])
+            s_curr = _normalize_step_text(steps[-1])
+            if _similarity(s_prev, s_curr) > 0.90:
+                stagnation += 1
+            else:
+                stagnation = 0
+
+        if critical_every and (step_idx % critical_every == 0) and step_idx < max_steps:
+            try:
+                crit = _critical_check(trace_id, steps, user_prompt)
+                steps.append({"trace_id": trace_id, "step": step_idx + 0.5, "mode": "reflect", "think": "crit", "answer": crit, "stop": False, "confidence": 0.7})
+            except Exception:
+                pass
+
+        if stagnation >= 1 and step_idx < max_steps:
+            temperature = min(0.9, temperature + 0.2)
+            try:
+                alt_low = call_liquid(render_context(), trace_id=trace_id, temperature=0.2)
+                alt_hi  = call_liquid(render_context(), trace_id=trace_id, temperature=0.6)
+                cands = [obj, alt_low, alt_hi]
+                def score(o: Dict[str, Any]) -> float:
+                    ans = str(o.get("answer",""))
+                    feat = 0.0
+                    feat += 0.2 if any(ch.isdigit() for ch in ans) else 0.0
+                    feat += 0.2 if ("- " in ans or "1." in ans) else 0.0
+                    feat += -0.3 if _similarity(final_answer, ans) > 0.85 else 0.0
+                    feat += float(o.get("confidence", 0.7)) * 0.4
+                    return feat + min(len(ans), 600)/600.0 * 0.2
+                best = max(cands, key=score)
+                if best is not obj:
+                    obj = best
+                    steps[-1]["think"] = str(obj.get("think",""))
+                    steps[-1]["answer"] = str(obj.get("answer",""))
+                    steps[-1]["confidence"] = float(obj.get("confidence", steps[-1]["confidence"]))
+                    final_answer = steps[-1]["answer"] or final_answer
+            except Exception:
+                pass
+
+        if conf < 0.5 and step_idx < max_steps and not stop:
+            try:
+                fixed = _verify_low_confidence(trace_id, user_prompt, final_answer or answer)
+                if fixed and fixed.strip() and _similarity(fixed, final_answer) < 0.92:
+                    steps.append({"trace_id": trace_id, "step": step_idx + 0.6, "mode": "reflect", "think": "verify", "answer": fixed, "stop": False, "confidence": 0.7})
+                    final_answer = fixed
+            except Exception:
+                pass
+
+        if stop or mode == "final" or stagnation >= progress_patience:
+            break
+
+    text = final_answer or json.dumps(steps[-1], ensure_ascii=False)
+    complexity, entropy = estimate_complexity_and_entropy(text)
+    thought_logger.log_turn(text, complexity, entropy)
+    return text
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Single-shot generate
+# ────────────────────────────────────────────────────────────────────────────────
+def reflect(prompt: str, draft: str, *, use_liquid: bool = True, max_new_tokens: int = 128, config: AriannaCConfig | None = None) -> str:
+    critique_prompt = (
+        "Critique the answer and propose fixes. Return JSON with keys trace_id, step, mode, think, answer, stop, confidence.\n"
+        f"Prompt: {prompt}\nAnswer: {draft}"
+    )
+    if use_liquid:
+        obj = call_liquid(critique_prompt, temperature=0.2)
+        return str(obj.get("answer", "")) or json.dumps(obj, ensure_ascii=False)
+    cfg = config or AriannaCConfig()
+    model = AriannaC(cfg)
+    idx = tokenizer.encode("Critique:\n" + critique_prompt)
+    out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
+    return tokenizer.decode(out[0])
+
+def generate_text(
+    prompt: Optional[str] = None,
+    *,
     use_memory: bool = False,
     memory_limit: int = 3,
     self_reflect: bool = False,
+    use_liquid: bool = True,
+    max_new_tokens: int = 256,
+    log_reasoning: bool = False,
 ) -> str | tuple[str, dict[str, float | int]]:
-    """Generate a completion optionally enriched with past prompts."""
-    prompt = prompt or CORE_PROMPT
-    config = config or AriannaCConfig()
-    monitor = SelfMonitor()
+    prompt = (prompt or CORE_PROMPT).strip()
+    sm = SelfMonitor()
     if use_memory:
-        examples = monitor.search(prompt, limit=memory_limit)
+        examples = sm.search(prompt, limit=memory_limit)
         if examples:
-            combined = "\n".join(
-                f"Prompt: {p}\nOutput: {o}" for p, o in examples
-            )
-            prompt = f"{combined}\n{prompt}"
-    model = AriannaC(config)
-    quantize_2bit(model)
-    model.eval()
+            combined = "\n".join(f"PrevPrompt: {p}\nPrevOutput: {o}" for p, o in examples)
+            prompt = f"{combined}\n\nCurrent:\n{prompt}"
+    if use_liquid:
+        try:
+            obj = call_liquid(prompt, temperature=0.3)
+            text = str(obj.get("answer", "")) or json.dumps(obj, ensure_ascii=False)
+            sm.log(prompt, text)
+            complexity, entropy = estimate_complexity_and_entropy(text)
+            rec = thought_logger.log_turn(text, complexity, entropy)
+            if self_reflect:
+                crit = reflect(prompt, text, use_liquid=True)
+                if "good" not in crit.lower():
+                    repair = call_liquid(f"Revise using this critique. Return JSON. Draft: {text}\nCritique: {crit}", temperature=0.0)
+                    text = str(repair.get("answer", text))
+                    sm.log("revise", text)
+            if log_reasoning:
+                return text, {"complexity": rec.complexity, "entropy": rec.entropy, "timestamp": rec.timestamp}
+            return text
+        except Exception:
+            model = AriannaC(AriannaCConfig())
+            idx = tokenizer.encode(prompt)
+            out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
+            text = "[liquid fallback] " + tokenizer.decode(out[0])
+            sm.log(prompt, text)
+            complexity, entropy = estimate_complexity_and_entropy(text)
+            rec = thought_logger.log_turn(text, complexity, entropy)
+            if log_reasoning:
+                return text, {"complexity": rec.complexity, "entropy": rec.entropy, "timestamp": rec.timestamp}
+            return text
+    model = AriannaC(AriannaCConfig())
     idx = tokenizer.encode(prompt)
-    out = model.generate(idx, max_new_tokens=max_new_tokens)
+    out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
     text = tokenizer.decode(out[0])
-    if self_reflect:
-        critique = reflect(prompt, text, max_new_tokens=max_new_tokens, config=config)
-        if "good" not in critique.lower():
-            revision_prompt = (
-                f"{prompt}\nDraft answer: {text}\nCritique: {critique}\nRevised answer:"
-            )
-            idx = tokenizer.encode(revision_prompt)
-            out = model.generate(idx, max_new_tokens=max_new_tokens)
-            text = tokenizer.decode(out[0])
-    monitor.log(prompt, text)
+    sm.log(prompt, text)
     complexity, entropy = estimate_complexity_and_entropy(text)
-    record = thought_logger.log_turn(text, complexity, entropy)
+    rec = thought_logger.log_turn(text, complexity, entropy)
     if log_reasoning:
-        return text, {
-            "complexity": record.complexity,
-            "entropy": record.entropy,
-            "timestamp": record.timestamp,
-        }
+        return text, {"complexity": rec.complexity, "entropy": rec.entropy, "timestamp": rec.timestamp}
     return text
 
+def generate_with_think(prompt: Optional[str] = None, **kwargs) -> str | tuple[str, dict[str, float | int]]:
+    return generate_text(prompt, log_reasoning=True, **kwargs)
 
-def reason_loop(
-    prompt: str | None = None,
-    *,
-    max_steps: int = 5,
-    stop_tokens: tuple[str, ...] = ("</think>", "</answer>"),
-    max_new_tokens: int = 50,
-    config: AriannaCConfig | None = None,
-) -> str:
-    """Iteratively alternate between ``<think>`` and ``<answer>`` phases."""
-    prompt = prompt or CORE_PROMPT
-    config = config or AriannaCConfig()
-    monitor = SelfMonitor()
-    model = AriannaC(config)
-    quantize_2bit(model)
-    model.eval()
-    text = prompt
-    final_answer = ""
-    for _ in range(max_steps):
-        think_prompt = f"{text}\n<think>"
-        idx = tokenizer.encode(think_prompt)
-        out = model.generate(idx, max_new_tokens=max_new_tokens)
-        new_tokens = out[:, idx.shape[1] :]
-        thought = tokenizer.decode(new_tokens)
-        monitor.log("<think>", thought)
-        text = tokenizer.decode(out[0])
-        if any(tok in thought for tok in stop_tokens):
-            break
-        answer_prompt = f"{text}\n<answer>"
-        idx = tokenizer.encode(answer_prompt)
-        out = model.generate(idx, max_new_tokens=max_new_tokens)
-        new_tokens = out[:, idx.shape[1] :]
-        final_answer = tokenizer.decode(new_tokens)
-        monitor.log("<answer>", final_answer)
-        text = tokenizer.decode(out[0])
-        if any(tok in final_answer for tok in stop_tokens):
-            break
-    return final_answer or text
-
-
-def generate_with_think(
-    prompt: str | None = None,
-    max_new_tokens: int = 50,
-    config: AriannaCConfig | None = None,
-    **kwargs,
-) -> str | tuple[str, dict[str, float | int]]:
-    """Generate text while allowing a hook for reasoning steps."""
-    return generate_text(
-        prompt,
-        max_new_tokens=max_new_tokens,
-        config=config,
-        log_reasoning=True,
-        **kwargs,
-    )
-
-
-def generate_consistent_text(
-    prompt: str | None = None,
-    n: int = 5,
-    **kwargs,
-) -> str:
-    """Generate multiple completions and return the most consistent answer."""
-    prompt = prompt or CORE_PROMPT
-    results: list[str] = []
+def generate_consistent_text(prompt: Optional[str] = None, n: int = 3, **kwargs) -> str:
+    prompt = (prompt or CORE_PROMPT).strip()
+    results: List[str] = []
     for _ in range(n):
-        output = generate_with_think(prompt, **kwargs)
-        final = output[-1] if isinstance(output, tuple) else output
-        results.append(final)
+        out = generate_with_think(prompt, **kwargs)
+        s = out[0] if isinstance(out, tuple) else out
+        results.append(s)
     counts = Counter(results)
-    most_common_answer, freq = counts.most_common(1)[0]
-    tied = [ans for ans, c in counts.items() if c == freq]
+    ans, freq = counts.most_common(1)[0]
+    tied = [a for a, c in counts.items() if c == freq]
     if len(tied) > 1:
-        most_common_answer = min(tied, key=len)
-    return most_common_answer
+        ans = min(tied, key=len)
+    return ans
 
-
-# --- CLI ---
+# ────────────────────────────────────────────────────────────────────────────────
+# CLI
+# ────────────────────────────────────────────────────────────────────────────────
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Arianna-C text generation")
+    parser = argparse.ArgumentParser(description="Arianna-C (liquid-weights ReAct)")
     parser.add_argument("prompt", nargs="?", help="prompt to complete")
-    parser.add_argument("--max-new-tokens", type=int, default=50)
+    parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--verbose", action="store_true", help="show reasoning log")
-    parser.add_argument(
-        "--consistency",
-        type=int,
-        default=1,
-        help="number of attempts to ensure answer consistency",
-    )
-    parser.add_argument(
-        "--reflect",
-        action="store_true",
-        help="enable self-verification through reflection",
-    )
-    parser.add_argument(
-        "--use-memory",
-        action="store_true",
-        help="prepend similar past prompts from memory",
-    )
-    parser.add_argument("--max-steps", type=int, default=0, help="max reasoning steps")
-    parser.add_argument(
-        "--stop-token",
-        action="append",
-        default=[],
-        help="token that halts the reasoning loop; can be used multiple times",
-    )
+    parser.add_argument("--consistency", type=int, default=1, help="n attempts for consistency vote")
+    parser.add_argument("--reflect", action="store_true", help="self-reflection using liquid weights")
+    parser.add_argument("--use-memory", action="store_true", help="prepend similar past prompts")
+    parser.add_argument("--max-steps", type=int, default=0, help="ReAct steps (use reason_loop)")
+    parser.add_argument("--no-liquid", action="store_true", help="disable liquid server (fallback to toy)")
+    parser.add_argument("--stream", action="store_true", help="use SSE streaming endpoint")
+    parser.add_argument("--checkpoint-every", type=int, default=2, help="insert checkpoint reflect every N steps")
+    parser.add_argument("--progress-patience", type=int, default=2, help="allowed consecutive similar steps before halt")
+    parser.add_argument("--critical-every", type=int, default=3, help="run critical check every N steps")
     args = parser.parse_args()
 
-    config = AriannaCConfig(vocab_size=256)
-    if args.max_steps or args.stop_token:
-        loop_kwargs: dict[str, object] = {
-            "max_new_tokens": args.max_new_tokens,
-            "config": config,
-        }
-        if args.max_steps:
-            loop_kwargs["max_steps"] = args.max_steps
-        if args.stop_token:
-            loop_kwargs["stop_tokens"] = tuple(args.stop_token)
-        result = reason_loop(args.prompt, **loop_kwargs)
+    use_liquid = not args.no_liquid
+
+    if args.max_steps > 0:
+        result = reason_loop(
+            args.prompt,
+            max_steps=args.max_steps,
+            use_liquid=use_liquid,
+            checkpoint_every=args.checkpoint_every,
+            progress_patience=args.progress_patience,
+            critical_every=args.critical_every,
+        )
         print(result)
     elif args.consistency > 1:
         result = generate_consistent_text(
             args.prompt,
             n=args.consistency,
-            max_new_tokens=args.max_new_tokens,
-            config=config,
-            self_reflect=args.reflect,
             use_memory=args.use_memory,
+            self_reflect=args.reflect,
+            use_liquid=use_liquid,
+            max_new_tokens=args.max_new_tokens,
         )
         print(result)
     else:
-        result = generate_text(
-            args.prompt,
-            max_new_tokens=args.max_new_tokens,
-            config=config,
-            log_reasoning=args.verbose,
-            self_reflect=args.reflect,
-            use_memory=args.use_memory,
-        )
-        if args.verbose:
-            text, meta = result
-            print(text)
-            print(
-                f"LOG@{meta['timestamp']} | Complexity: {meta['complexity']} | Entropy: {meta['entropy']:.2f}"
-            )
+        if args.stream and use_liquid and args.prompt:
+            buf = ""
+            for etype, data in call_liquid_stream(args.prompt):
+                if etype == "response.output_text.delta" and isinstance(data, dict):
+                    buf += str(data.get("delta", ""))
+                elif etype == "response.completed" and isinstance(data, dict):
+                    buf = str(data.get("answer", buf))
+            print(buf)
         else:
-            print(result)
-
+            result = generate_text(
+                args.prompt,
+                use_memory=args.use_memory,
+                self_reflect=args.reflect,
+                use_liquid=use_liquid,
+                max_new_tokens=args.max_new_tokens,
+                log_reasoning=args.verbose,
+            )
+            if args.verbose:
+                text, meta = result  # type: ignore[assignment]
+                print(text)
+                print(f"LOG@{meta['timestamp']} | Complexity: {meta['complexity']} | Entropy: {meta['entropy']:.2f}")
+            else:
+                print(result)
 
 if __name__ == "__main__":  # pragma: no cover
     main()
-
 
 __all__ = [
     "AriannaC",
@@ -562,5 +947,7 @@ __all__ = [
     "generate_with_think",
     "generate_consistent_text",
     "tokenizer",
-    "TokenizerWrapper",
+    "ByteTokenizer",
+    "call_liquid",
+    "call_liquid_stream",
 ]
