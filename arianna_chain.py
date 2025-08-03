@@ -124,6 +124,35 @@ class ByteTokenizer:
 tokenizer = ByteTokenizer()
 
 # ────────────────────────────────────────────────────────────────────────────────
+# Reasoning utilities
+# ────────────────────────────────────────────────────────────────────────────────
+TAG_RE = re.compile(r"^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$", re.DOTALL)
+
+
+def validate_reasoning_tags(text: str) -> bool:
+    """Verify that ``text`` contains properly ordered ``<think>`` and ``<answer>`` tags.
+
+    The function checks for a single pair of ``<think>…</think>`` followed by
+    ``<answer>…</answer>`` with no extraneous content outside the tags.
+    """
+
+    return bool(TAG_RE.fullmatch(text.strip()))
+
+
+def reasoning_steps_reward(text: str) -> float:
+    """Simple reward proportional to the number of ``<think>`` blocks.
+
+    This mirrors ``open_r1.rewards.reasoning_steps_reward`` by assigning
+    one point for each properly enclosed reasoning segment. Malformed text
+    yields a reward of ``0``.
+    """
+
+    if not validate_reasoning_tags(text):
+        return 0.0
+    steps = re.findall(r"<think>(.*?)</think>", text, flags=re.DOTALL)
+    return float(len(steps))
+
+# ────────────────────────────────────────────────────────────────────────────────
 # Complexity / entropy лог
 # ────────────────────────────────────────────────────────────────────────────────
 @dataclass
@@ -133,6 +162,7 @@ class ThoughtLogEntry:
     tokens: int
     entropy: float
     perplexity: float | None = None
+    valid_tags: bool = True
 
 class ThoughtComplexityLogger:
     def __init__(self, log_file: str | Path = "logs/thought_log.jsonl") -> None:
@@ -147,12 +177,14 @@ class ThoughtComplexityLogger:
         entropy: float,
         perplexity: float | None = None,
     ) -> ThoughtLogEntry:
+        valid = validate_reasoning_tags(message)
         entry = ThoughtLogEntry(
             timestamp=datetime.utcnow().isoformat() + "Z",
             message=message,
             tokens=max(0, int(tokens)),
             entropy=float(entropy),
             perplexity=None if perplexity is None else float(perplexity),
+            valid_tags=valid,
         )
         self.logs.append(entry)
         with self.log_file.open("a", encoding="utf-8") as f:
@@ -1183,4 +1215,6 @@ __all__ = [
     "ByteTokenizer",
     "call_liquid",
     "call_liquid_stream",
+    "validate_reasoning_tags",
+    "reasoning_steps_reward",
 ]

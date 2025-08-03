@@ -13,7 +13,27 @@ from arianna_chain import (
     reason_loop,
     tree_reason_loop,
     tokenizer,
+    validate_reasoning_tags,
+    ThoughtComplexityLogger,
 )
+
+
+def test_validate_reasoning_tags_valid() -> None:
+    txt = "<think>reason</think><answer>result</answer>"
+    assert validate_reasoning_tags(txt)
+
+
+def test_validate_reasoning_tags_invalid() -> None:
+    txt = "<think>oops<answer>missing close</answer>"
+    assert not validate_reasoning_tags(txt)
+
+
+def test_log_turn_flags_invalid_tags(tmp_path) -> None:
+    logger = ThoughtComplexityLogger(log_file=tmp_path / "log.jsonl")
+    good = logger.log_turn("<think>a</think><answer>b</answer>", 1, 0.0)
+    bad = logger.log_turn("no tags here", 1, 0.0)
+    assert good.valid_tags is True
+    assert bad.valid_tags is False
 
 
 def test_generate_with_think_returns_thought_and_final() -> None:
