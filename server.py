@@ -8,6 +8,7 @@ import random
 import logging
 import threading
 import hashlib
+import re
 from typing import Dict, Any, Callable, Generator, Tuple, Optional
 from logging.handlers import RotatingFileHandler
 from functools import wraps
@@ -387,6 +388,15 @@ def _extract_usage(resp) -> Dict[str, int]:
         pass
     return usage
 
+
+def _detect_red_flags(text: str) -> list[str]:
+    flags: list[str] = []
+    if re.search(r"<([a-zA-Z0-9]+)\s*>\s*</\1>", text):
+        flags.append("empty_tag")
+    if re.search(r"contradiction|противореч", text, re.IGNORECASE):
+        flags.append("contradiction")
+    return flags
+
 def _responses_create(prompt: str, *, model: Optional[str], temperature: float, top_p: float
                       ) -> Tuple[Dict[str, Any], Dict[str, int], Optional[str]]:
     client = _openai_client()
@@ -404,6 +414,31 @@ def _responses_create(prompt: str, *, model: Optional[str], temperature: float, 
     except Exception:
         pass
     content = getattr(resp, "output_text", "") or json.dumps(resp.to_dict_recursive(), ensure_ascii=False)
+
+    flags = _detect_red_flags(content)
+    if flags:
+        app.logger.warning("red flags detected %s", flags)
+        app.logger.info("openai id %s initial response: %s", openai_id, content)
+        corr_prompt = (
+            "Исправь пустые теги и противоречия в следующем ответе."
+            " Верни исправленный ответ в том же формате:\n" + content
+        )
+        resp2 = client.responses.create(
+            model=model or MODEL_DEFAULT,
+            input=corr_prompt,
+            temperature=0,
+            top_p=top_p,
+            response_format={"type": "json_schema", "json_schema": _response_json_schema()},
+        )
+        usage2 = _extract_usage(resp2)
+        for k, v in usage2.items():
+            usage[k] = usage.get(k, 0) + v
+        try:
+            openai_id = resp2.to_dict_recursive().get("id") or openai_id
+        except Exception:
+            pass
+        content = getattr(resp2, "output_text", "") or json.dumps(resp2.to_dict_recursive(), ensure_ascii=False)
+        app.logger.info("openai id %s corrected response: %s", openai_id, content)
     try:
         obj = json.loads(content)
     except Exception:
