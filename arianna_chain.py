@@ -651,6 +651,7 @@ def reason_loop(
     base_temperature: float = 0.3,
     checkpoint_every: int = 2,
     critical_every: int = 3,
+    beams: int = 1,
 ) -> str:
     user_prompt = (prompt or CORE_PROMPT).strip()
     sm = SelfMonitor()
@@ -714,13 +715,35 @@ def reason_loop(
         ctx = render_context(expected_next)
         ensure_budget(ctx)
 
+        def _reason_reward(o: Dict[str, Any]) -> float:
+            ans = str(o.get("answer", ""))
+            feat = 0.0
+            feat += 0.2 if any(ch.isdigit() for ch in ans) else 0.0
+            feat += 0.2 if ("- " in ans or "1." in ans) else 0.0
+            feat += -0.3 if _similarity(final_answer, ans) > 0.85 else 0.0
+            feat += float(o.get("confidence", 0.7)) * 0.4
+            feat += min(len(ans), 600) / 600.0 * 0.2
+            return feat
+
+        candidates: List[Dict[str, Any]] = []
         if use_liquid:
-            obj = call_liquid(ctx, trace_id=trace_id, temperature=temperature)
+            for b in range(max(1, beams)):
+                t = min(0.9, temperature + 0.2 * b)
+                try:
+                    candidates.append(call_liquid(ctx, trace_id=trace_id, temperature=t))
+                except Exception:
+                    model = AriannaC(AriannaCConfig())
+                    idx = tokenizer.encode(ctx)
+                    out = model.generate(idx, max_new_tokens=128)
+                    candidates.append({"mode": "final", "think": "", "answer": tokenizer.decode(out[0]), "stop": True, "step": step_idx, "trace_id": trace_id, "confidence": 0.6})
+                    break
         else:
             model = AriannaC(AriannaCConfig())
             idx = tokenizer.encode(ctx)
-            out = model.generate(idx, max_new_tokens=128, temperature=0.0)
-            obj = {"mode": "final", "think": "", "answer": tokenizer.decode(out[0]), "stop": True, "step": step_idx, "trace_id": trace_id, "confidence": 0.6}
+            out = model.generate(idx, max_new_tokens=128)
+            candidates.append({"mode": "final", "think": "", "answer": tokenizer.decode(out[0]), "stop": True, "step": step_idx, "trace_id": trace_id, "confidence": 0.6})
+
+        obj = max(candidates, key=_reason_reward)
 
         mode = str(obj.get("mode", "final"))
         think = str(obj.get("think", ""))
@@ -770,6 +793,8 @@ def reason_loop(
             except Exception as e:
                 observation = json.dumps({"ok": False, "error": str(e)})
 
+        sm.log("<think>", think)
+        sm.log("<answer>", answer)
         step_obj: Dict[str, Any] = {
             "trace_id": trace_id, "step": step_idx, "mode": mode,
             "think": think, "answer": answer, "stop": stop, "confidence": conf
@@ -894,7 +919,14 @@ def generate_text(
             model = AriannaC(AriannaCConfig())
             idx = tokenizer.encode(prompt)
             out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
-            text = "[liquid fallback] " + tokenizer.decode(out[0])
+            text = tokenizer.decode(out[0])
+            if self_reflect:
+                crit = reflect(prompt, text, use_liquid=False)
+                if "good" not in crit.lower():
+                    idx = tokenizer.encode(f"Revise using this critique. Draft: {text}\nCritique: {crit}")
+                    out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
+                    text = tokenizer.decode(out[0])
+                    sm.log("revise", text)
             sm.log(prompt, text)
             complexity, entropy = estimate_complexity_and_entropy(text)
             rec = thought_logger.log_turn(text, complexity, entropy)
@@ -905,6 +937,13 @@ def generate_text(
     idx = tokenizer.encode(prompt)
     out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
     text = tokenizer.decode(out[0])
+    if self_reflect:
+        crit = reflect(prompt, text, use_liquid=False)
+        if "good" not in crit.lower():
+            idx = tokenizer.encode(f"Revise using this critique. Draft: {text}\nCritique: {crit}")
+            out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
+            text = tokenizer.decode(out[0])
+            sm.log("revise", text)
     sm.log(prompt, text)
     complexity, entropy = estimate_complexity_and_entropy(text)
     rec = thought_logger.log_turn(text, complexity, entropy)
@@ -912,8 +951,20 @@ def generate_text(
         return text, {"complexity": rec.complexity, "entropy": rec.entropy, "timestamp": rec.timestamp}
     return text
 
-def generate_with_think(prompt: Optional[str] = None, **kwargs) -> str | tuple[str, dict[str, float | int]]:
-    return generate_text(prompt, log_reasoning=True, **kwargs)
+def generate_with_think(
+    prompt: Optional[str] = None,
+    *,
+    max_new_tokens: int = 50,
+    config: AriannaCConfig | None = None,
+    **kwargs,
+) -> str | tuple[str, dict[str, float | int]]:
+    return generate_text(
+        prompt,
+        max_new_tokens=max_new_tokens,
+        config=config,
+        log_reasoning=True,
+        **kwargs,
+    )
 
 def generate_consistent_text(prompt: Optional[str] = None, n: int = 3, **kwargs) -> str:
     prompt = (prompt or CORE_PROMPT).strip()
@@ -946,6 +997,7 @@ def main() -> None:
     parser.add_argument("--checkpoint-every", type=int, default=2, help="insert checkpoint reflect every N steps")
     parser.add_argument("--progress-patience", type=int, default=2, help="allowed consecutive similar steps before halt")
     parser.add_argument("--critical-every", type=int, default=3, help="run critical check every N steps")
+    parser.add_argument("--beams", type=int, default=1, help="number of candidate beams per step")
     args = parser.parse_args()
 
     use_liquid = not args.no_liquid
@@ -958,6 +1010,7 @@ def main() -> None:
             checkpoint_every=args.checkpoint_every,
             progress_patience=args.progress_patience,
             critical_every=args.critical_every,
+            beams=args.beams,
         )
         print(result)
     elif args.consistency > 1:
