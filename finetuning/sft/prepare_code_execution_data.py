@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
 
-from rewards import format_reward, reasoning_steps_reward
+from arianna_chain import format_reward, reasoning_steps_reward
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

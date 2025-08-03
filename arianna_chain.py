@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any, Iterable, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from rewards import format_reward, reasoning_steps_reward
 
 import requests
 import torch
@@ -145,18 +144,41 @@ def validate_reasoning_tags(text: str) -> bool:
     return bool(TAG_RE.fullmatch(text.strip()))
 
 
-def reasoning_steps_reward(text: str) -> float:
-    """Simple reward proportional to the number of ``<think>`` blocks.
+def format_reward(text: str) -> float:
+    """Return 1.0 if text contains single <think>/<answer> blocks in order.
 
-    This mirrors ``open_r1.rewards.reasoning_steps_reward`` by assigning
-    one point for each properly enclosed reasoning segment. Malformed text
-    yields a reward of ``0``.
+    The function checks that the response includes exactly one <think>...</think>
+    block followed by one <answer>...</answer> block. If the format is not
+    respected, ``0.0`` is returned.
     """
 
-    if not validate_reasoning_tags(text):
+    think_blocks = re.findall(r"<think>(.*?)</think>", text, flags=re.DOTALL)
+    answer_blocks = re.findall(r"<answer>(.*?)</answer>", text, flags=re.DOTALL)
+    if len(think_blocks) != 1 or len(answer_blocks) != 1:
         return 0.0
-    steps = re.findall(r"<think>(.*?)</think>", text, flags=re.DOTALL)
-    return float(len(steps))
+    think_pos = text.find("<think>")
+    answer_pos = text.find("<answer>")
+    return 1.0 if 0 <= think_pos < answer_pos else 0.0
+
+
+def reasoning_steps_reward(text: str) -> float:
+    """Return 1.0 if at least three numbered/bulleted steps exist in <think>.
+
+    The function inspects the content of the <think> block and counts lines
+    starting with a number, ``-`` or ``*``. A reward of ``1.0`` is given when at
+    least three such lines are found, otherwise ``0.0``.
+    """
+
+    match = re.search(r"<think>(.*?)</think>", text, flags=re.DOTALL)
+    if not match:
+        return 0.0
+    think_content = match.group(1)
+    lines = [line.strip() for line in think_content.splitlines()]
+    count = 0
+    for line in lines:
+        if re.match(r"^(\d+\.\s+|-\s+|\*\s+)", line):
+            count += 1
+    return 1.0 if count >= 3 else 0.0
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Complexity / entropy лог
@@ -236,6 +258,58 @@ def estimate_complexity_and_entropy(
     return token_count, entropy, perplexity
 
 thought_logger = ThoughtComplexityLogger()
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Simple vector store
+# ────────────────────────────────────────────────────────────────────────────────
+class VectorStore:
+    """Store documents as dense vectors and perform similarity search."""
+
+    def __init__(self, documents: List[str] | None = None, dim: int = 128) -> None:
+        self.dim = dim
+        self.documents: List[str] = []
+        if faiss:
+            self.index = faiss.IndexFlatIP(dim)
+        else:  # pragma: no cover - fallback path
+            self.index = None
+            self.vectors: List[np.ndarray] = []
+        if documents:
+            self.add(documents)
+
+    def _embed(self, text: str) -> np.ndarray:
+        vec = np.frombuffer(text.encode("utf-8"), dtype=np.uint8).astype("float32")
+        if vec.size < self.dim:
+            vec = np.pad(vec, (0, self.dim - vec.size))
+        else:
+            vec = vec[: self.dim]
+        norm = np.linalg.norm(vec) or 1.0
+        return vec / norm
+
+    def add(self, docs: List[str]) -> None:
+        embeddings = (
+            np.vstack([self._embed(d) for d in docs])
+            if docs
+            else np.empty((0, self.dim), dtype="float32")
+        )
+        if self.index is not None and embeddings.size:
+            self.index.add(embeddings)
+        else:  # pragma: no cover - fallback path
+            for emb in embeddings:
+                self.vectors.append(emb)
+        self.documents.extend(docs)
+
+    def search(self, query: str, k: int = 3) -> List[str]:
+        if not self.documents:
+            return []
+        qvec = self._embed(query).reshape(1, -1)
+        k = min(k, len(self.documents))
+        if self.index is not None:
+            _, idxs = self.index.search(qvec, k)
+            ids = idxs[0]
+        else:  # pragma: no cover - fallback path
+            sims = [float(np.dot(qvec.squeeze(), v)) for v in self.vectors]
+            ids = np.argsort(sims)[::-1][:k]
+        return [self.documents[i] for i in ids]
 
 # ────────────────────────────────────────────────────────────────────────────────
 # 2-bit quant (toy)
@@ -914,7 +988,6 @@ def reason_loop(
     user_prompt = (prompt or CORE_PROMPT).strip()
     if retrieve:
         try:
-            from retrieval.vector_store import VectorStore
             store = VectorStore()
             docs = store.search(user_prompt)
             if docs:
@@ -1264,7 +1337,6 @@ def generate_text(
     prompt = (prompt or CORE_PROMPT).strip()
     if retrieve:
         try:
-            from retrieval.vector_store import VectorStore
             store = VectorStore()
             docs = store.search(prompt)
             if docs:
