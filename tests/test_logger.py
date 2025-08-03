@@ -10,7 +10,7 @@ def test_estimate_complexity_and_entropy_keywords():
 
 def test_logger_records_and_recent():
     logger = ThoughtComplexityLogger(log_file="logs/test_log.jsonl")
-    entry = logger.log_turn("test message", 2, 0.5)
+    entry = logger.log_turn("test message", 2, 0.5, confidence=0.8)
     assert entry.tokens == 2
     assert entry.perplexity is None
     assert logger.recent(1)[0].message == "test message"

@@ -169,6 +169,7 @@ class ThoughtLogEntry:
     entropy: float
     perplexity: float | None = None
     valid_tags: bool = True
+    confidence: float = 0.0
 
 class ThoughtComplexityLogger:
     def __init__(self, log_file: str | Path = "logs/thought_log.jsonl") -> None:
@@ -182,6 +183,7 @@ class ThoughtComplexityLogger:
         tokens: int,
         entropy: float,
         perplexity: float | None = None,
+        confidence: float = 0.0,
     ) -> ThoughtLogEntry:
         valid = validate_reasoning_tags(message)
         entry = ThoughtLogEntry(
@@ -191,6 +193,7 @@ class ThoughtComplexityLogger:
             entropy=float(entropy),
             perplexity=None if perplexity is None else float(perplexity),
             valid_tags=valid,
+            confidence=float(confidence),
         )
         self.logs.append(entry)
         with self.log_file.open("a", encoding="utf-8") as f:
@@ -1089,7 +1092,29 @@ def reason_loop(
 
     text = final_answer or json.dumps(steps[-1], ensure_ascii=False)
     tokens, entropy, perplexity = estimate_complexity_and_entropy(text)
-    thought_logger.log_turn(text, tokens, entropy, perplexity)
+    final_conf = float(steps[-1].get("confidence", 0.0)) if steps else 0.0
+    thought_logger.log_turn(text, tokens, entropy, perplexity, final_conf)
+
+    plan = ""
+    for s in steps:
+        if s.get("mode") == "plan":
+            plan = s.get("answer", "")
+            break
+    distill_path = Path("logs/distill.jsonl")
+    distill_path.parent.mkdir(parents=True, exist_ok=True)
+    with distill_path.open("a", encoding="utf-8") as f:
+        f.write(
+            json.dumps(
+                {
+                    "prompt": user_prompt,
+                    "plan": plan,
+                    "answer": text,
+                    "confidence": final_conf,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
     return text
 
 
@@ -1203,7 +1228,8 @@ def generate_text(
             text = f"<plan>{plan}</plan>\n<think>{think}</think>\n<answer>{answer}</answer>"
             sm.log(prompt, text)
             tokens, entropy, perplexity = estimate_complexity_and_entropy(text)
-            rec = thought_logger.log_turn(text, tokens, entropy, perplexity)
+            conf = float(obj.get("confidence", 1.0 - entropy))
+            rec = thought_logger.log_turn(text, tokens, entropy, perplexity, conf)
             if self_reflect:
                 crit = reflect(prompt, text, use_liquid=True)
                 if "good" not in crit.lower():
@@ -1230,7 +1256,8 @@ def generate_text(
                     sm.log("revise", text)
             sm.log(prompt, text)
             tokens, entropy, perplexity = estimate_complexity_and_entropy(text, model)
-            rec = thought_logger.log_turn(text, tokens, entropy, perplexity)
+            conf = 1.0 - entropy
+            rec = thought_logger.log_turn(text, tokens, entropy, perplexity, conf)
             if log_reasoning:
                 return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
             return text
@@ -1247,7 +1274,8 @@ def generate_text(
             sm.log("revise", text)
     sm.log(prompt, text)
     tokens, entropy, perplexity = estimate_complexity_and_entropy(text, model)
-    rec = thought_logger.log_turn(text, tokens, entropy, perplexity)
+    conf = 1.0 - entropy
+    rec = thought_logger.log_turn(text, tokens, entropy, perplexity, conf)
     if log_reasoning:
         return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
     return text

@@ -31,8 +31,8 @@ def test_validate_reasoning_tags_invalid() -> None:
 
 def test_log_turn_flags_invalid_tags(tmp_path) -> None:
     logger = ThoughtComplexityLogger(log_file=tmp_path / "log.jsonl")
-    good = logger.log_turn("<think>a</think><answer>b</answer>", 1, 0.0)
-    bad = logger.log_turn("no tags here", 1, 0.0)
+    good = logger.log_turn("<think>a</think><answer>b</answer>", 1, 0.0, confidence=0.9)
+    bad = logger.log_turn("no tags here", 1, 0.0, confidence=0.2)
     assert good.valid_tags is True
     assert bad.valid_tags is False
 
@@ -94,6 +94,37 @@ def test_reason_loop_alternates_and_logs() -> None:
     assert isinstance(result, str)
     assert mock_log.call_args_list[0][0][0] == "<think>"
     assert mock_log.call_args_list[1][0][0] == "<answer>"
+
+
+def test_reason_loop_writes_distill_log(tmp_path, monkeypatch) -> None:
+    class DummyModel:
+        def __init__(self, *args, **kwargs) -> None:
+            self.calls = 0
+
+        def eval(self) -> None:  # pragma: no cover
+            pass
+
+        def generate(self, idx, max_new_tokens):  # pragma: no cover
+            self.calls += 1
+            addition = tokenizer.encode(" answer")
+            return torch.cat([idx, addition], dim=1)
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "logs").mkdir()
+    with (
+        patch("arianna_chain.AriannaC", DummyModel),
+        patch("arianna_chain.quantize_2bit", lambda _: None),
+        patch("arianna_chain.SelfMonitor.__init__", return_value=None),
+        patch("arianna_chain.SelfMonitor.log"),
+        patch("arianna_chain.call_liquid", side_effect=RuntimeError),
+    ):
+        reason_loop("Q", max_steps=1)
+
+    distill_path = Path("logs/distill.jsonl")
+    assert distill_path.exists()
+    entry = json.loads(distill_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert entry["prompt"] == "Q"
+    assert "answer" in entry and "confidence" in entry
 
 
 def test_reason_loop_beam_selects_highest_scoring() -> None:
