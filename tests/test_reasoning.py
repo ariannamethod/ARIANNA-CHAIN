@@ -13,6 +13,7 @@ from arianna_chain import (
     reason_loop,
     tree_reason_loop,
     tokenizer,
+    _tool_code_exec,
 )
 
 
@@ -127,3 +128,15 @@ def test_gsm8k_subset_accuracy() -> None:
 
     accuracy = correct / len(samples)
     assert accuracy == 1.0
+
+
+def test_tool_code_exec_stdout_and_stderr() -> None:
+    res = json.loads(_tool_code_exec("import sys;\nprint(1+1);\nsys.stderr.write('err\\n')"))
+    assert res["stdout"].strip() == "2"
+    assert res["stderr"].strip() == "err"
+
+
+def test_tool_code_exec_error_handling() -> None:
+    res = json.loads(_tool_code_exec("1/0"))
+    assert not res["ok"]
+    assert "ZeroDivisionError" in res["stderr"]

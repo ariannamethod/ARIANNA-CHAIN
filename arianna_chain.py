@@ -619,6 +619,33 @@ def _tool_date_parse(text: str) -> str:
     except Exception:
         return json.dumps({"ok": False, "error": "unrecognized date"})
 
+def _tool_code_exec(code: str, timeout: float = 2.0) -> str:
+    import subprocess, resource
+
+    def _limit_resources() -> None:
+        resource.setrlimit(resource.RLIMIT_AS, (64 * 1024 * 1024, 64 * 1024 * 1024))
+        resource.setrlimit(resource.RLIMIT_CPU, (1, 1))
+
+    try:
+        proc = subprocess.run(
+            ["python3", "-"],
+            input=code,
+            text=True,
+            capture_output=True,
+            timeout=max(0.1, float(timeout)),
+            preexec_fn=_limit_resources,
+        )
+        stdout = proc.stdout[:2000]
+        stderr = proc.stderr[:2000]
+        ok = proc.returncode == 0
+        return json.dumps({"ok": ok, "stdout": stdout, "stderr": stderr}, ensure_ascii=False)
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout[:2000] if e.stdout else ""
+        err = e.stderr[:2000] if e.stderr else ""
+        return json.dumps({"ok": False, "stdout": out, "stderr": err, "error": "timeout"}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+
 TOOLS: Dict[str, Callable[..., str]] = {
     "memory.search":      lambda **kw: _tool_memory_search(str(kw.get("query","")), int(kw.get("limit",3))),
     "memory.note":        lambda **kw: _tool_memory_note(str(kw.get("text",""))),
@@ -626,6 +653,7 @@ TOOLS: Dict[str, Callable[..., str]] = {
     "time.now":           lambda **kw: _tool_time_now(),
     "text.regex_extract": lambda **kw: _tool_text_regex_extract(str(kw.get("pattern","")), str(kw.get("text","")), int(kw.get("limit",10)), str(kw.get("flags",""))),
     "date.parse":         lambda **kw: _tool_date_parse(str(kw.get("text",""))),
+    "code.exec":          lambda **kw: _tool_code_exec(str(kw.get("code","")), float(kw.get("timeout",2.0))),
 }
 
 def _tools_manifest() -> str:
@@ -636,7 +664,8 @@ def _tools_manifest() -> str:
             "math.eval":          {"args": {"expr": "string"}, "desc": "evaluate a safe arithmetic expression."},
             "time.now":           {"args": {}, "desc": "UTC timestamp now."},
             "text.regex_extract": {"args": {"pattern": "string", "text": "string", "limit":"int", "flags":"string"}, "desc": "regex matches as JSON list."},
-            "date.parse":         {"args": {"text": "string"}, "desc": "parse common date formats to ISO date."}
+            "date.parse":         {"args": {"text": "string"}, "desc": "parse common date formats to ISO date."},
+            "code.exec":          {"args": {"code": "string"}, "desc": "run Python code in a sandboxed subprocess; returns JSON with stdout/stderr."}
         }
     }, ensure_ascii=False)
 
