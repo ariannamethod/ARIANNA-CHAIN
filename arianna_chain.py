@@ -29,6 +29,7 @@ from rewards import format_reward, reasoning_steps_reward
 import requests
 import torch
 import torch.nn as nn
+from models.moe_adapter import MoEBlock
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Core prompt (embedded persona)
@@ -488,60 +489,15 @@ class AriannaCConfig:
     n_embd: int = 512
     dropout: float = 0.0
     apply_quant: bool = True
+    n_experts: int = 4
+    active_experts: int = 1
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config: AriannaCConfig):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        self.key = nn.Linear(config.n_embd, config.n_embd, bias=False)
-        self.query = nn.Linear(config.n_embd, config.n_embd, bias=False)
-        self.value = nn.Linear(config.n_embd, config.n_embd, bias=False)
-        self.proj = nn.Linear(config.n_embd, config.n_embd)
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.head_dim = config.n_embd // config.n_head
-        self.register_buffer(
-            "bias",
-            torch.tril(torch.ones(config.block_size, config.block_size)).view(1,1,config.block_size,config.block_size),
-            persistent=False,
-        )
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B,T,C = x.size()
-        k = self.key(x).view(B,T,self.n_head,self.head_dim).transpose(1,2)
-        q = self.query(x).view(B,T,self.n_head,self.head_dim).transpose(1,2)
-        v = self.value(x).view(B,T,self.n_head,self.head_dim).transpose(1,2)
-        att = (q @ k.transpose(-2,-1)) * (1.0 / math.sqrt(self.head_dim))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-        att = torch.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
-        y = att @ v
-        y = y.transpose(1,2).contiguous().view(B,T,C)
-        y = self.resid_dropout(self.proj(y))
-        return y
 
-class MLP(nn.Module):
-    def __init__(self, config: AriannaCConfig):
-        super().__init__()
-        self.fc = nn.Linear(config.n_embd, 4*config.n_embd)
-        self.proj = nn.Linear(4*config.n_embd, config.n_embd)
-        self.dropout = nn.Dropout(config.dropout)
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = torch.nn.functional.gelu(self.fc(x))
-        x = self.proj(x)
-        return self.dropout(x)
+ACTIVE_EXPERTS = 1
 
-class Block(nn.Module):
-    def __init__(self, config: AriannaCConfig):
-        super().__init__()
-        self.ln1 = nn.LayerNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config)
-        self.ln2 = nn.LayerNorm(config.n_embd)
-        self.mlp = MLP(config)
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x))
-        x = x + self.mlp(self.ln2(x))
-        return x
+
+def default_config() -> AriannaCConfig:
+    return AriannaCConfig(active_experts=ACTIVE_EXPERTS)
 
 class AriannaC(nn.Module):
     def __init__(self, config: AriannaCConfig):
@@ -550,7 +506,7 @@ class AriannaC(nn.Module):
         self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
         self.position_embedding = nn.Embedding(config.block_size, config.n_embd)
         self.drop = nn.Dropout(config.dropout)
-        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        self.blocks = nn.ModuleList([MoEBlock(config) for _ in range(config.n_layer)])
         self.ln_f = nn.LayerNorm(config.n_embd)
         self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.block_size = config.block_size
@@ -989,13 +945,13 @@ def reason_loop(
                 try:
                     candidates.append(call_liquid(ctx, trace_id=trace_id, temperature=t))
                 except Exception:
-                    model = AriannaC(AriannaCConfig())
+                    model = AriannaC(default_config())
                     idx = tokenizer.encode(ctx)
                     out = model.generate(idx, max_new_tokens=128)
                     candidates.append({"mode": "final", "think": "", "answer": tokenizer.decode(out[0]), "stop": True, "step": step_idx, "trace_id": trace_id, "confidence": 0.6})
                     break
         else:
-            model = AriannaC(AriannaCConfig())
+            model = AriannaC(default_config())
             idx = tokenizer.encode(ctx)
             out = model.generate(idx, max_new_tokens=128)
             candidates.append({"mode": "final", "think": "", "answer": tokenizer.decode(out[0]), "stop": True, "step": step_idx, "trace_id": trace_id, "confidence": 0.6})
@@ -1234,7 +1190,7 @@ def reflect(prompt: str, draft: str, *, use_liquid: bool = True, max_new_tokens:
     if use_liquid:
         obj = call_liquid(critique_prompt, temperature=0.2)
         return str(obj.get("answer", "")) or json.dumps(obj, ensure_ascii=False)
-    cfg = config or AriannaCConfig()
+    cfg = config or default_config()
     model = AriannaC(cfg)
     idx = tokenizer.encode("Critique:\n" + critique_prompt)
     out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
@@ -1292,7 +1248,7 @@ def generate_text(
                 return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
             return text
         except Exception:
-            model = AriannaC(AriannaCConfig())
+            model = AriannaC(default_config())
             idx = tokenizer.encode(prompt)
             out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
             text = tokenizer.decode(out[0])
@@ -1310,7 +1266,7 @@ def generate_text(
             if log_reasoning:
                 return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
             return text
-    model = AriannaC(AriannaCConfig())
+    model = AriannaC(default_config())
     idx = tokenizer.encode(prompt)
     out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
     text = tokenizer.decode(out[0])
@@ -1377,9 +1333,12 @@ def main() -> None:
     parser.add_argument("--critical-every", type=int, default=3, help="run critical check every N steps")
     parser.add_argument("--beams", type=int, default=1, help="number of candidate beams per step")
     parser.add_argument("--beam-size", type=int, default=1, help="number of reasoning branches for tree search")
+    parser.add_argument("--experts", type=int, default=1, help="number of active experts")
     args = parser.parse_args()
 
     use_liquid = not args.no_liquid
+    global ACTIVE_EXPERTS
+    ACTIVE_EXPERTS = args.experts
 
     if args.max_steps > 0:
         if args.beam_size > 1:
