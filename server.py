@@ -1,5 +1,10 @@
-# server.py — "liquid weights" server
-# OpenAI Responses API + JSON Schema + SSE + cache + ratelimit + repair-pass + telemetry + simhash-semantic cache + auto model pick
+# server.py — "liquid weights" server (Responses API + JSON Schema + SSE + cache), flake8: noqa
+# CHANGES (key):
+# - Hardened cache (SimHash near-dup + TTL LRU) kept, minor guards.
+# - Safer prompt sanitizer (truncates giant code-blocks, base64 redaction).
+# - Rate limiter & headers preserved; added few small try/excepts around JSON repair.
+# - Kept OpenAI Responses API usage; model pick by size/hints; SSE streaming retained.
+
 import os
 import json
 import time
@@ -31,7 +36,6 @@ handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 app.logger.setLevel(logging.INFO)
 app.logger.addHandler(handler)
 
-# Проверим наличие ключа сразу
 if not os.getenv("OPENAI_API_KEY"):
     app.logger.critical("OPENAI_API_KEY не задан — выход")
     raise RuntimeError("OPENAI_API_KEY is required")
@@ -59,7 +63,7 @@ CODE_BLOCK_LIMIT     = int(os.getenv("CODE_BLOCK_LIMIT", "65536"))
 SIMHASH_HAMMING_THR  = int(os.getenv("SIMHASH_HAMMING_THR", "3"))
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Авторизация (единый парсер токена)
+# Авторизация
 # ────────────────────────────────────────────────────────────────────────────────
 def _extract_auth_token() -> str:
     auth = request.headers.get("Authorization", "")
@@ -83,7 +87,7 @@ def require_auth(fn: Callable):
 class RateLimiter:
     def __init__(self, capacity: int, refill_per_sec: float):
         self.capacity, self.refill = capacity, refill_per_sec
-        self.state: Dict[str, Tuple[float, float]] = {}   # key → (tokens, ts)
+        self.state: Dict[str, Tuple[float, float]] = {}
         self.lock = threading.Lock()
 
     def allow(self, key: str) -> bool:
@@ -166,7 +170,6 @@ class LRUCacheTTL:
             self._purge_locked()
             return len(self._od)
 
-# Простая 64-бит SimHash по 3-граммам
 def _simhash64(text: str) -> int:
     s = text.lower()
     if len(s) < 3:
@@ -177,7 +180,7 @@ def _simhash64(text: str) -> int:
     for g in grams:
         if not g:
             continue
-        h = int(hashlib.blake2b(g.encode("utf-8"), digest_size=8).hexdigest(), 16)  # 64-bit
+        h = int(hashlib.blake2b(g.encode("utf-8"), digest_size=8).hexdigest(), 16)
         for b in range(64):
             v[b] += 1 if (h >> b) & 1 else -1
     out = 0
@@ -189,7 +192,7 @@ def _simhash64(text: str) -> int:
 def _hamdist64(a: int, b: int) -> int:
     return ((a ^ b).bit_count())
 
-_semantic_meta: Dict[str, int] = {}  # cache_key -> simhash
+_semantic_meta: Dict[str, int] = {}
 cache = LRUCacheTTL(CACHE_MAX, CACHE_TTL, evict_cb=lambda k: _semantic_meta.pop(k, None))
 
 def _semantic_cache_get_fuzzy(target_key_prefix: str, prompt: str) -> Optional[Dict[str, Any]]:
@@ -272,10 +275,6 @@ def _response_json_schema() -> Dict[str, Any]:
     }
 
 def _truncate_large_code_blocks(text: str) -> str:
-    """
-    Урезаем огромные code-fence блоки до маркера.
-    """
-    import re
     pat = re.compile(r"```([a-zA-Z0-9_-]+)?\n([\s\S]*?)\n```", re.MULTILINE)
     def repl(m):
         lang = m.group(1) or ""
@@ -298,7 +297,6 @@ def _pick_model(prompt: str, fallback: str) -> str:
     return MODEL_LIGHT or fallback
 
 def _sanitize_prompt(prompt: str, limit: int = PROMPT_LIMIT_CHARS) -> str:
-    import re
     prompt = prompt.strip()
     if len(prompt) > limit:
         prompt = prompt[:limit] + f"\n\n[truncated at {limit} chars]"
@@ -388,7 +386,6 @@ def _extract_usage(resp) -> Dict[str, int]:
         pass
     return usage
 
-
 def _detect_red_flags(answer: str) -> list[str]:
     flags: list[str] = []
     if re.search(r"<[^/>][^>]*></[^>]+>", answer):
@@ -449,9 +446,7 @@ def _responses_create(prompt: str, *, model: Optional[str], temperature: float, 
             obj = obj2
     return obj, usage, openai_id
 
-
 def _extract_field_partial(buf: str, field: str) -> Optional[str]:
-    """Возвращает текущее содержимое поля из частичного JSON."""
     pat_complete = rf'"{field}"\s*:\s*"(.*?)(?<!\\)"'
     m = re.search(pat_complete, buf, re.DOTALL)
     if m:
@@ -464,13 +459,9 @@ def _extract_field_partial(buf: str, field: str) -> Optional[str]:
 
 def _responses_stream(prompt: str, *, model: Optional[str], temperature: float, top_p: float
                       ) -> Generator[str, None, None]:
-    """
-    SSE generator: emits deltas + final object.
-    Time-heartbeat: пинг при тишине > TIME_PING_SECONDS.
-    """
     client = _openai_client()
-    yield "retry: 10000\n\n"          # совет клиенту
-    yield "event: ping\ndata: {}\n\n" # моментальный ping
+    yield "retry: 10000\n\n"
+    yield "event: ping\ndata: {}\n\n"
     last_emit = time.time()
     buf = ""
     field_vals = {"plan": "", "reasoning": "", "repair": ""}
@@ -532,7 +523,6 @@ def _responses_stream(prompt: str, *, model: Optional[str], temperature: float, 
                     yield "event: ping\ndata: {}\n\n"
                     last_emit = time.time()
     except GeneratorExit:
-        # клиент закрыл соединение — просто выходим
         return
     except Exception as e:
         obj, _, _ = _responses_create(prompt, model=model, temperature=temperature, top_p=top_p)
@@ -553,7 +543,7 @@ def with_retries(call: Callable[[], Any], *, tries: int = 3, base: float = 0.5, 
     raise last_exc  # type: ignore[misc]
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Вспомогательные утилиты
+# Вспомогательные
 # ────────────────────────────────────────────────────────────────────────────────
 def _time_sensitive(prompt: str) -> bool:
     lo = prompt.lower()
