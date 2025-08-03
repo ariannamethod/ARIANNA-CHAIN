@@ -12,6 +12,7 @@ from arianna_chain import (
     generate_with_think,
     reason_loop,
     tree_reason_loop,
+    multi_reason,
     tokenizer,
 )
 
@@ -107,6 +108,30 @@ def test_tree_reason_loop_selects_best_branch() -> None:
 
     assert result == "good"
     assert mock_loop.call_count == 2
+
+
+def test_multi_reason_majority_selection() -> None:
+    """``multi_reason`` should choose the majority answer across paths."""
+
+    outputs = ["A", "B", "A", "A"]
+    temps: list[float] = []
+
+    def fake_reason(prompt, base_temperature=0.3, **kwargs):
+        temps.append(base_temperature)
+        return outputs.pop(0)
+
+    with (
+        patch("arianna_chain.reason_loop", side_effect=fake_reason) as mock_loop,
+        patch("arianna_chain.SelfMonitor.__init__", return_value=None),
+        patch("arianna_chain.SelfMonitor.log") as mock_log,
+    ):
+        result = multi_reason("Q", paths=4)
+
+    assert result == "A"
+    assert mock_loop.call_count == 4
+    assert len({round(t, 2) for t in temps}) > 1
+    path_logs = [c for c in mock_log.call_args_list if c[0][0] == "<path>"]
+    assert len(path_logs) == 4
 
 
 def test_gsm8k_subset_accuracy() -> None:
