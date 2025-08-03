@@ -87,6 +87,56 @@ def test_reason_loop_beam_selects_highest_scoring() -> None:
     assert result == "1. numbered"
 
 
+def test_reason_loop_respects_allowed_transitions() -> None:
+    """Ensure a valid sequence of modes is preserved."""
+
+    responses = [
+        {"mode": "plan", "think": "p", "answer": "", "stop": False, "confidence": 0.7},
+        {
+            "mode": "act",
+            "think": "do",
+            "answer": "",
+            "stop": False,
+            "confidence": 0.7,
+            "action": {"name": "foo", "args": {}},
+        },
+        {"mode": "reflect", "think": "r", "answer": "", "stop": False, "confidence": 0.7},
+        {"mode": "final", "think": "", "answer": "done", "stop": True, "confidence": 0.7},
+    ]
+
+    with (
+        patch("arianna_chain.call_liquid", side_effect=responses),
+        patch("arianna_chain.SelfMonitor.__init__", return_value=None),
+        patch("arianna_chain.SelfMonitor.log") as mock_log,
+    ):
+        result = reason_loop("Q", max_steps=4)
+
+    step_logs = [json.loads(c.args[1]) for c in mock_log.call_args_list if c.args[0] == "<step>"]
+    assert [s["mode"] for s in step_logs] == ["plan", "act", "reflect", "final"]
+    assert result == "done"
+
+
+def test_reason_loop_inserts_reflect_on_invalid_transition() -> None:
+    """Disallowed transitions should trigger a corrective reflect step."""
+
+    responses = [
+        {"mode": "plan", "think": "p", "answer": "", "stop": False, "confidence": 0.7},
+        {"mode": "reflect", "think": "r", "answer": "bad", "stop": False, "confidence": 0.7},
+    ]
+
+    with (
+        patch("arianna_chain.call_liquid", side_effect=responses),
+        patch("arianna_chain.SelfMonitor.__init__", return_value=None),
+        patch("arianna_chain.SelfMonitor.log") as mock_log,
+    ):
+        reason_loop("Q", max_steps=2)
+
+    step_logs = [json.loads(c.args[1]) for c in mock_log.call_args_list if c.args[0] == "<step>"]
+    assert step_logs[1]["mode"] == "reflect"
+    assert "Invalid transition" in step_logs[1]["answer"]
+    assert step_logs[2]["mode"] == "plan"
+
+
 def test_gsm8k_subset_accuracy() -> None:
     """Evaluate simple math questions and compute accuracy."""
 

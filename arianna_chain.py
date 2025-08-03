@@ -660,6 +660,7 @@ def reason_loop(
     stagnation = 0
     final_answer = ""
     temperature = base_temperature
+    prev_mode: Optional[str] = None
 
     def render_context(expected_next: str = "") -> str:
         lines = [
@@ -795,9 +796,34 @@ def reason_loop(
 
         sm.log("<think>", think)
         sm.log("<answer>", answer)
+
+        invalid = False
+        if prev_mode is not None and mode not in _ALLOWED_TRANSITIONS.get(prev_mode, set()):
+            violation = f"Invalid transition: {prev_mode} -> {mode}. Switching to plan"
+            reflect_obj = {
+                "trace_id": trace_id,
+                "step": step_idx,
+                "mode": "reflect",
+                "think": "transition violation",
+                "answer": violation,
+                "stop": False,
+                "confidence": 0.0,
+            }
+            sm.log("<step>", json.dumps(reflect_obj, ensure_ascii=False))
+            steps.append(reflect_obj)
+            prev_mode = "reflect"
+            mode = "plan"
+            stop = False
+            invalid = True
+
         step_obj: Dict[str, Any] = {
-            "trace_id": trace_id, "step": step_idx, "mode": mode,
-            "think": think, "answer": answer, "stop": stop, "confidence": conf
+            "trace_id": trace_id,
+            "step": step_idx + (0.1 if invalid else 0),
+            "mode": mode,
+            "think": think,
+            "answer": answer,
+            "stop": stop,
+            "confidence": conf,
         }
         if isinstance(obj.get("tokens_used"), dict):
             step_obj["tokens_used"] = obj["tokens_used"]
@@ -808,6 +834,8 @@ def reason_loop(
         steps.append(step_obj)
         if answer:
             final_answer = answer
+
+        prev_mode = mode
 
         if len(steps) >= 2:
             s_prev = _normalize_step_text(steps[-2])
