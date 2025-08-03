@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from unittest.mock import patch
-
 import json
+import re
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -85,6 +85,43 @@ def test_reason_loop_beam_selects_highest_scoring() -> None:
         result = reason_loop("Q", max_steps=1, beams=2)
 
     assert result == "1. numbered"
+
+
+def test_reason_loop_enforces_think_answer_format() -> None:
+    """``reason_loop`` should return text with explicit think and answer tags."""
+
+    pattern = re.compile(r"^<think>.+?</think><answer>.+?</answer>$", re.DOTALL)
+    good_response = {
+        "mode": "final",
+        "think": "thought",
+        "answer": "<think>thought</think><answer>result</answer>",
+        "stop": True,
+        "confidence": 0.9,
+    }
+
+    with (
+        patch("arianna_chain.call_liquid", return_value=good_response),
+        patch("arianna_chain.SelfMonitor.__init__", return_value=None),
+        patch("arianna_chain.SelfMonitor.log"),
+    ):
+        result = reason_loop("Q", max_steps=1)
+
+    assert pattern.fullmatch(result)
+
+    bad_answers = [
+        "<think>missing closing</think><answer>answer",
+        "<answer>no think</answer>",
+        "plain",
+    ]
+    for bad in bad_answers:
+        bad_resp = dict(good_response, answer=bad)
+        with (
+            patch("arianna_chain.call_liquid", return_value=bad_resp),
+            patch("arianna_chain.SelfMonitor.__init__", return_value=None),
+            patch("arianna_chain.SelfMonitor.log"),
+        ):
+            out = reason_loop("Q", max_steps=1)
+        assert not pattern.fullmatch(out)
 
 
 def test_gsm8k_subset_accuracy() -> None:
