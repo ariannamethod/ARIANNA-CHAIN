@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any, Iterable, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from rewards import format_reward, reasoning_steps_reward
+
 import requests
 import torch
 import torch.nn as nn
@@ -803,6 +805,12 @@ def reason_loop(
             step_obj["tokens_used"] = obj["tokens_used"]
         if act: step_obj["action"] = act
         if observation: step_obj["observation"] = observation
+
+        resp_text = f"<think>{think}</think>\n<answer>{answer}</answer>"
+        fmt_score = format_reward(resp_text)
+        steps_score = reasoning_steps_reward(resp_text)
+        step_obj["rewards"] = {"format": fmt_score, "reasoning_steps": steps_score}
+        sm.log("<reward>", json.dumps({"step": step_idx, "format": fmt_score, "reasoning_steps": steps_score}))
 
         sm.log("<step>", json.dumps(step_obj, ensure_ascii=False))
         steps.append(step_obj)

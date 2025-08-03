@@ -6,6 +6,8 @@ import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
 
+from rewards import format_reward, reasoning_steps_reward
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -99,6 +101,17 @@ def main():
 
     with open(args.output, "w", encoding="utf-8") as outfile:
         for task in all_tasks:
+            text = f"<think>{task['prompt']}</think>\n<answer>{task['solution']}</answer>"
+            fmt_score = format_reward(text)
+            steps_score = reasoning_steps_reward(text)
+            task["format_reward"] = fmt_score
+            task["reasoning_steps_reward"] = steps_score
+            logger.info(
+                "Rewards for %s: format=%.2f reasoning=%.2f",
+                task["prompt"][:30],
+                fmt_score,
+                steps_score,
+            )
             outfile.write(json.dumps(task, ensure_ascii=False) + "\n")
 
     logger.info("Wrote %d tasks to %s", len(all_tasks), args.output)
