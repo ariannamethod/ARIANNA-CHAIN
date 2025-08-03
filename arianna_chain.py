@@ -13,6 +13,10 @@ import sqlite3
 import time
 import uuid
 import numpy as np
+try:
+    import faiss  # type: ignore
+except Exception:  # pragma: no cover
+    faiss = None
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -257,6 +261,13 @@ class SelfMonitor:
         env_flag = os.getenv("ARIANNA_DISABLE_EMBED", "").lower() in {"1", "true", "yes"}
         self.use_embeddings = use_embeddings if use_embeddings is not None else not env_flag
         self.embed_model = None
+        self.faiss_index = None
+        self.faiss_ids: list[str] = []
+        self.faiss_dim = 0
+        self.index_dir = Path("logs/faiss_index")
+        self.index_file = self.index_dir / "index.faiss"
+        self.ids_file = self.index_dir / "ids.json"
+        self._load_faiss_index()
         self._init_db()
         if not SelfMonitor._snapshotted:
             self.snapshot_codebase()
@@ -270,6 +281,36 @@ class SelfMonitor:
         cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS notes_index USING fts5(text)")
         cur.execute("CREATE TABLE IF NOT EXISTS embeddings(sha256 TEXT PRIMARY KEY, embedding BLOB)")
         self.conn.commit()
+
+    def _load_faiss_index(self) -> None:
+        if faiss is None:
+            return
+        self.index_dir.mkdir(parents=True, exist_ok=True)
+        if self.index_file.exists() and self.ids_file.exists():
+            try:
+                self.faiss_index = faiss.read_index(str(self.index_file))
+                self.faiss_ids = json.loads(self.ids_file.read_text())
+                self.faiss_dim = self.faiss_index.d
+            except Exception:
+                self.faiss_index = None
+                self.faiss_ids = []
+                self.faiss_dim = 0
+
+    def _add_to_index(self, sha: str, vec: np.ndarray) -> None:
+        if faiss is None:
+            return
+        dim = len(vec)
+        if self.faiss_index is None:
+            self.faiss_index = faiss.IndexFlatIP(dim)
+            self.faiss_dim = dim
+        if dim != self.faiss_dim:
+            return
+        v = vec.astype("float32")
+        n = np.linalg.norm(v) + 1e-9
+        self.faiss_index.add((v / n).reshape(1, -1))
+        self.faiss_ids.append(sha)
+        faiss.write_index(self.faiss_index, str(self.index_file))
+        self.ids_file.write_text(json.dumps(self.faiss_ids))
     def snapshot_codebase(self, root: str | Path = ".") -> None:
         root_path = Path(root)
         SKIP_DIRS = {".git", "__pycache__", "venv", "env", "logs", "node_modules", ".pytest_cache"}
@@ -296,11 +337,12 @@ class SelfMonitor:
             )
             if model:
                 text = data.decode("utf-8", errors="ignore")
-                vec = model.encode([text])[0].astype("float32").tobytes()
+                vec = model.encode([text])[0].astype("float32")
                 cur.execute(
                     "INSERT OR REPLACE INTO embeddings(sha256, embedding) VALUES (?,?)",
-                    (sha, sqlite3.Binary(vec)),
+                    (sha, sqlite3.Binary(vec.tobytes())),
                 )
+                self._add_to_index(sha, vec)
         self.conn.commit()
     def _ensure_embed_model(self):
         if not self.use_embeddings:
@@ -322,8 +364,9 @@ class SelfMonitor:
         cur.execute("INSERT INTO logs(ts, prompt, output, sha256) VALUES (?,?,?,?)", (time.time(), prompt, output, sha))
         cur.execute("INSERT INTO prompts_index(prompt, output) VALUES (?,?)", (prompt, output))
         if self._ensure_embed_model():
-            vec = self.embed_model.encode([prompt])[0].astype("float32").tobytes()
-            cur.execute("INSERT OR REPLACE INTO embeddings(sha256, embedding) VALUES (?,?)", (sha, sqlite3.Binary(vec)))
+            vec = self.embed_model.encode([prompt])[0].astype("float32")
+            cur.execute("INSERT OR REPLACE INTO embeddings(sha256, embedding) VALUES (?,?)", (sha, sqlite3.Binary(vec.tobytes())))
+            self._add_to_index(sha, vec)
         self.conn.commit()
     def note(self, text: str) -> None:
         cur = self.conn.cursor()
@@ -359,38 +402,33 @@ class SelfMonitor:
         ordered = sorted(scored.items(), key=lambda kv: kv[1], reverse=True)
         return [pair for pair, _ in ordered[:limit]]
 
-    def search_embedding(self, query: str, limit: int = 5, return_scores: bool = False):
-        if not self._ensure_embed_model():
+    def search_faiss(self, query: str, limit: int = 5, return_scores: bool = False):
+        if not self._ensure_embed_model() or self.faiss_index is None:
             return []
         qv = self.embed_model.encode([query])[0].astype("float32")
-        cur = self.conn.cursor()
-        cur.execute("SELECT sha256, embedding FROM embeddings")
-        rows = cur.fetchall()
-        if not rows:
+        if len(qv) != self.faiss_dim:
             return []
-        sha_list: list[str] = []
-        mat = []
-        for sha, blob in rows:
-            vec = np.frombuffer(blob, dtype=np.float32)
-            sha_list.append(sha)
-            mat.append(vec)
-        emb_matrix = np.stack(mat)
-        q_norm = np.linalg.norm(qv) + 1e-9
-        sims = (emb_matrix @ qv) / (np.linalg.norm(emb_matrix, axis=1) * q_norm + 1e-9)
-        top_idx = np.argsort(-sims)[:limit]
+        n = np.linalg.norm(qv) + 1e-9
+        D, I = self.faiss_index.search((qv / n).reshape(1, -1), limit)
+        cur = self.conn.cursor()
         out = []
-        for i in top_idx:
-            sha = sha_list[int(i)]
+        for score, idx in zip(D[0], I[0]):
+            if idx == -1 or idx >= len(self.faiss_ids):
+                continue
+            sha = self.faiss_ids[int(idx)]
             cur.execute("SELECT prompt, output FROM logs WHERE sha256 = ? ORDER BY ts DESC LIMIT 1", (sha,))
             row = cur.fetchone()
             if row:
                 if return_scores:
-                    out.append((row[0], row[1], float((sims[int(i)] + 1) / 2)))
+                    out.append((row[0], row[1], float((score + 1) / 2)))
                 else:
                     out.append(row)
         return out
+
+    def search_embedding(self, query: str, limit: int = 5, return_scores: bool = False):
+        return self.search_faiss(query, limit=limit, return_scores=return_scores)
     def search_prompts_and_notes(self, query: str, limit: int = 5) -> list[str]:
-        prs = self.search_embedding(query, limit=limit) or self._search_tfidf(query, limit=limit)
+        prs = self.search_faiss(query, limit=limit)
         nts = self._search_notes(query, limit=limit)
         out = []
         for p, o in prs:
@@ -621,11 +659,18 @@ def _redact(text: str) -> str:
 
 def _tool_memory_search(query: str, limit: int = 3) -> str:
     sm = SelfMonitor()
-    hits = sm.search_prompts_and_notes(query, limit=limit)
-    if not hits:
+    pairs = sm.search_faiss(query, limit=limit)
+    notes = sm._search_notes(query, limit=limit)
+    if not pairs and not notes:
         return "(no hits)"
-    out = [f"- { _redact(h) }" for h in hits]
-    return "\n".join(out)
+    out = []
+    for p, o in pairs:
+        p1 = _redact(p.strip().splitlines()[0][:160])
+        o1 = _redact(o.strip().splitlines()[0][:200])
+        out.append(f"- Q:{p1} | A:{o1}")
+    for n in notes:
+        out.append(f"- { _redact(n) }")
+    return "\n".join(out[:limit])
 
 def _tool_memory_note(text: str) -> str:
     sm = SelfMonitor()
