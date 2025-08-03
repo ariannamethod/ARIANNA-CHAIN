@@ -4,3 +4,4 @@ flask
 openai>=1.0.0
 gunicorn
 sentence-transformers
+faiss-cpu
