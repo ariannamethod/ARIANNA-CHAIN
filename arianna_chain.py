@@ -889,6 +889,39 @@ def tree_reason_loop(
     best_answer, _ = max(branches, key=lambda x: x[1])
     return best_answer
 
+
+def multi_reason(prompt: Optional[str] = None, paths: int = 5, **reason_kwargs) -> str:
+    """Run :func:`reason_loop` along multiple paths with varying temperatures.
+
+    Each path's answer is scored by its estimated confidence and how diverse it
+    is compared to other paths. The answer with the highest combined score is
+    returned. All intermediate path results are logged through
+    :class:`SelfMonitor` for later analysis.
+    """
+
+    sm = SelfMonitor()
+    temps = [0.2 + 0.6 * i / max(1, paths - 1) for i in range(max(1, paths))]
+    results: List[Dict[str, Any]] = []
+    for t in temps:
+        ans = reason_loop(prompt, base_temperature=t, **reason_kwargs)
+        conf = 1.0 - estimate_complexity_and_entropy(ans)[1]
+        entry = {"temperature": t, "answer": ans, "confidence": conf}
+        sm.log("<path>", json.dumps(entry, ensure_ascii=False))
+        results.append(entry)
+
+    counts = Counter(r["answer"] for r in results)
+    unique_answers = list(counts.keys())
+
+    def score(ans: str) -> float:
+        freq = counts[ans]
+        avg_conf = sum(r["confidence"] for r in results if r["answer"] == ans) / freq
+        diversities = [1 - _similarity(ans, other) for other in unique_answers if other != ans]
+        diversity = sum(diversities) / len(diversities) if diversities else 1.0
+        return freq + avg_conf + diversity
+
+    best = max(unique_answers, key=score)
+    return best
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Single-shot generate
 # ────────────────────────────────────────────────────────────────────────────────
@@ -1094,6 +1127,7 @@ __all__ = [
     "generate_text",
     "reason_loop",
     "tree_reason_loop",
+    "multi_reason",
     "reflect",
     "quantize_2bit",
     "SelfMonitor",
