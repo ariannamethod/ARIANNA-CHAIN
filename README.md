@@ -59,6 +59,18 @@ The test loads each question, queries the model, and reports the final
 accuracy. Replace the dataset or hook in a different generation function to
 benchmark other models.
 
+## GRPO Training
+
+A minimal GRPO loop is available for reward-based fine-tuning. It reads a
+JSONL dataset of ``prompt``/``solution`` pairs and logs rewards for accuracy,
+reasoning tags and output length.
+
+```bash
+python finetuning/grpo_train.py --dataset datasets/gsm8k_subset.jsonl --epochs 3 --save-every 50
+```
+
+Checkpoints and training logs are stored under ``logs/grpo/``.
+
 ## 🧬 System Prompt
 
 Arianna-C loads the following core prompt at startup. If no prompt is provided, this voice becomes the default:
