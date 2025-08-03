@@ -12,6 +12,7 @@ import re
 import sqlite3
 import time
 import uuid
+import random
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -990,6 +991,35 @@ def generate_with_think(
         **kwargs,
     )
 
+def reason_consistent(prompt: Optional[str] = None, n: int = 3, **reason_kwargs) -> str:
+    """Run :func:`reason_loop` ``n`` times and return the most consistent answer."""
+
+    prompt = (prompt or CORE_PROMPT).strip()
+    results: List[Tuple[str, float]] = []
+    for i in range(n):
+        random.seed(i)
+        torch.manual_seed(i)
+        out = reason_loop(
+            prompt,
+            base_temperature=min(0.9, 0.3 + 0.1 * i),
+            **reason_kwargs,
+        )
+        if isinstance(out, tuple):
+            ans = str(out[0])
+            conf = float(out[1]) if len(out) > 1 else 0.0
+        else:
+            ans = str(out)
+            conf = 0.0
+        results.append((ans, conf))
+    counts = Counter(a for a, _ in results)
+    answer, freq = counts.most_common(1)[0]
+    tied = [a for a, c in counts.items() if c == freq]
+    if len(tied) > 1:
+        def best_conf(x: str) -> float:
+            return max(conf for ans, conf in results if ans == x)
+        answer = max(tied, key=best_conf)
+    return answer
+
 def generate_consistent_text(prompt: Optional[str] = None, n: int = 3, **kwargs) -> str:
     prompt = (prompt or CORE_PROMPT).strip()
     results: List[str] = []
@@ -1023,12 +1053,24 @@ def main() -> None:
     parser.add_argument("--critical-every", type=int, default=3, help="run critical check every N steps")
     parser.add_argument("--beams", type=int, default=1, help="number of candidate beams per step")
     parser.add_argument("--beam-size", type=int, default=1, help="number of reasoning branches for tree search")
+    parser.add_argument("--reason-n", type=int, default=1, help="repeat reasoning n times")
     args = parser.parse_args()
 
     use_liquid = not args.no_liquid
 
     if args.max_steps > 0:
-        if args.beam_size > 1:
+        if args.reason_n > 1:
+            result = reason_consistent(
+                args.prompt,
+                n=args.reason_n,
+                max_steps=args.max_steps,
+                use_liquid=use_liquid,
+                checkpoint_every=args.checkpoint_every,
+                progress_patience=args.progress_patience,
+                critical_every=args.critical_every,
+                beams=args.beams,
+            )
+        elif args.beam_size > 1:
             result = tree_reason_loop(
                 args.prompt,
                 beam_size=args.beam_size,
@@ -1103,6 +1145,7 @@ __all__ = [
     "estimate_complexity_and_entropy",
     "thought_logger",
     "generate_with_think",
+    "reason_consistent",
     "generate_consistent_text",
     "tokenizer",
     "ByteTokenizer",

@@ -11,8 +11,10 @@ from arianna_chain import (
     generate_consistent_text,
     generate_with_think,
     reason_loop,
+    reason_consistent,
     tree_reason_loop,
     tokenizer,
+    main,
 )
 
 
@@ -42,6 +44,22 @@ def test_consistency_improves_with_multiple_attempts() -> None:
 
     assert single != "A"
     assert multi == "A"
+
+
+def test_reason_consistent_majority_and_tie_breaker() -> None:
+    """``reason_consistent`` should favor majority or highest confidence."""
+
+    with patch(
+        "arianna_chain.reason_loop",
+        side_effect=[("X", 0.1), ("Y", 0.9), ("Y", 0.8)],
+    ):
+        assert reason_consistent("Q", n=3) == "Y"
+
+    with patch(
+        "arianna_chain.reason_loop",
+        side_effect=[("A", 0.4), ("B", 0.9)],
+    ):
+        assert reason_consistent("Q", n=2) == "B"
 
 
 def test_reason_loop_alternates_and_logs() -> None:
@@ -107,6 +125,27 @@ def test_tree_reason_loop_selects_best_branch() -> None:
 
     assert result == "good"
     assert mock_loop.call_count == 2
+
+
+def test_cli_invokes_reason_consistent_when_requested(capsys) -> None:
+    """The CLI should use ``reason_consistent`` when ``--reason-n`` > 1."""
+
+    with patch("arianna_chain.reason_consistent", return_value="final") as mock_consistent:
+        with patch(
+            "sys.argv",
+            [
+                "arianna_chain.py",
+                "--max-steps",
+                "1",
+                "--reason-n",
+                "2",
+                "Q",
+            ],
+        ):
+            main()
+
+    assert capsys.readouterr().out.strip() == "final"
+    mock_consistent.assert_called_once()
 
 
 def test_gsm8k_subset_accuracy() -> None:
