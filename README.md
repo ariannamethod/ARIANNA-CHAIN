@@ -20,6 +20,18 @@ Inspired by Andrej Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT), th
 python arianna_chain.py "2+2="
 ```
 
+## Streaming SSE events
+
+The server sends Server-Sent Events while generating a reply:
+
+- `plan.delta` – incremental planning text
+- `reasoning.delta` – reasoning trace fragments
+- `repair.delta` – self-repair fragments
+- `response.output_text.delta` – answer text chunks
+- `response.completed` – final result object
+- `ping` – keep-alive heartbeat
+- `response.error` – error details
+
 ## Reasoning Logger
 
 The engine now keeps a running account of its own cognitive load. Each response is examined through a heuristic lens that gauges how tangled the thought felt and how varied the vocabulary spread itself across the page. This record grows quietly in the background and may be summoned when reflection is desired.
