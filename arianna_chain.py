@@ -865,6 +865,30 @@ def reason_loop(
     thought_logger.log_turn(text, complexity, entropy)
     return text
 
+
+def tree_reason_loop(
+    prompt: Optional[str] = None,
+    *,
+    beam_size: int = 2,
+    depth: int = 2,
+    score_fn: Callable[[str], float] | None = None,
+    **reason_kwargs: Any,
+) -> str:
+    """Spawn multiple reasoning branches and select the highest scoring answer.
+
+    Each branch runs :func:`reason_loop` for ``depth`` steps. The resulting
+    answers are scored either by ``score_fn`` or by the entropy heuristic used
+    elsewhere in the project. The answer with the highest score is returned.
+    """
+
+    scorer = score_fn or (lambda ans: estimate_complexity_and_entropy(ans)[1])
+    branches: List[Tuple[str, float]] = []
+    for _ in range(max(1, beam_size)):
+        ans = reason_loop(prompt, max_steps=depth, **reason_kwargs)
+        branches.append((ans, scorer(ans)))
+    best_answer, _ = max(branches, key=lambda x: x[1])
+    return best_answer
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Single-shot generate
 # ────────────────────────────────────────────────────────────────────────────────
@@ -998,20 +1022,33 @@ def main() -> None:
     parser.add_argument("--progress-patience", type=int, default=2, help="allowed consecutive similar steps before halt")
     parser.add_argument("--critical-every", type=int, default=3, help="run critical check every N steps")
     parser.add_argument("--beams", type=int, default=1, help="number of candidate beams per step")
+    parser.add_argument("--beam-size", type=int, default=1, help="number of reasoning branches for tree search")
     args = parser.parse_args()
 
     use_liquid = not args.no_liquid
 
     if args.max_steps > 0:
-        result = reason_loop(
-            args.prompt,
-            max_steps=args.max_steps,
-            use_liquid=use_liquid,
-            checkpoint_every=args.checkpoint_every,
-            progress_patience=args.progress_patience,
-            critical_every=args.critical_every,
-            beams=args.beams,
-        )
+        if args.beam_size > 1:
+            result = tree_reason_loop(
+                args.prompt,
+                beam_size=args.beam_size,
+                depth=args.max_steps,
+                use_liquid=use_liquid,
+                checkpoint_every=args.checkpoint_every,
+                progress_patience=args.progress_patience,
+                critical_every=args.critical_every,
+                beams=args.beams,
+            )
+        else:
+            result = reason_loop(
+                args.prompt,
+                max_steps=args.max_steps,
+                use_liquid=use_liquid,
+                checkpoint_every=args.checkpoint_every,
+                progress_patience=args.progress_patience,
+                critical_every=args.critical_every,
+                beams=args.beams,
+            )
         print(result)
     elif args.consistency > 1:
         result = generate_consistent_text(
@@ -1056,6 +1093,7 @@ __all__ = [
     "AriannaCConfig",
     "generate_text",
     "reason_loop",
+    "tree_reason_loop",
     "reflect",
     "quantize_2bit",
     "SelfMonitor",

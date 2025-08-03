@@ -7,7 +7,13 @@ from pathlib import Path
 
 import torch
 
-from arianna_chain import generate_consistent_text, generate_with_think, reason_loop, tokenizer
+from arianna_chain import (
+    generate_consistent_text,
+    generate_with_think,
+    reason_loop,
+    tree_reason_loop,
+    tokenizer,
+)
 
 
 def test_generate_with_think_returns_thought_and_final() -> None:
@@ -85,6 +91,22 @@ def test_reason_loop_beam_selects_highest_scoring() -> None:
         result = reason_loop("Q", max_steps=1, beams=2)
 
     assert result == "1. numbered"
+
+
+def test_tree_reason_loop_selects_best_branch() -> None:
+    """Tree search should evaluate multiple branches and pick the best."""
+
+    with (
+        patch("arianna_chain.reason_loop", side_effect=["bad", "good"]) as mock_loop,
+        patch(
+            "arianna_chain.estimate_complexity_and_entropy",
+            side_effect=lambda ans: (1, {"bad": 0.1, "good": 0.9}[ans]),
+        ),
+    ):
+        result = tree_reason_loop("Q", beam_size=2, depth=1)
+
+    assert result == "good"
+    assert mock_loop.call_count == 2
 
 
 def test_gsm8k_subset_accuracy() -> None:
