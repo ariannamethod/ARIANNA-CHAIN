@@ -1,3 +1,5 @@
+# server.py — "liquid weights" server
+# OpenAI Responses API + JSON Schema + SSE + cache + ratelimit + repair-pass + telemetry + simhash-semantic cache + auto model pick
 import os
 import json
 import time
@@ -14,9 +16,6 @@ from collections import OrderedDict
 from flask import Flask, request, jsonify, Response, make_response
 from openai import OpenAI
 
-# ────────────────────────────────────────────────────────────────────────────────
-# App + логирование
-# ────────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
 LOG_DIR = os.path.join("logs", "server")
