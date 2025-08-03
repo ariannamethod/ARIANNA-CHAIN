@@ -603,14 +603,12 @@ def call_liquid_stream(prompt: str, *, temperature: Optional[float] = None, top_
                 data = {"raw": data_raw}
             yield (current_event, data)
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Tools (safe & redacted) + manifest
-# ────────────────────────────────────────────────────────────────────────────────
 _SECRET_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9]{20,}"),
     re.compile(r"(?i)(api[_-]?key|token)[\"'\s:]*[A-Za-z0-9\-_]{16,}"),
     re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"),  # JWT-ish
 ]
+
 
 def _redact(text: str) -> str:
     red = text
@@ -619,99 +617,35 @@ def _redact(text: str) -> str:
     red = re.sub(r"[A-Za-z0-9+/]{200,}={0,2}", "[BASE64_REDACTED]", red)
     return red
 
-def _tool_memory_search(query: str, limit: int = 3) -> str:
-    sm = SelfMonitor()
-    hits = sm.search_prompts_and_notes(query, limit=limit)
-    if not hits:
-        return "(no hits)"
-    out = [f"- { _redact(h) }" for h in hits]
-    return "\n".join(out)
 
-def _tool_memory_note(text: str) -> str:
-    sm = SelfMonitor()
-    sm.note(_redact(text)[:1000])
-    return "ok"
+def _load_tools() -> tuple[Dict[str, Callable[..., str]], Dict[str, Dict[str, Any]]]:
+    tools_dir = Path(__file__).parent / "tools"
+    tools: Dict[str, Callable[..., str]] = {}
+    manifest: Dict[str, Dict[str, Any]] = {}
+    if tools_dir.exists():
+        for path in tools_dir.glob("*.py"):
+            if path.name.startswith("_"):
+                continue
+            mod_name = f"tools.{path.stem}"
+            module = __import__(mod_name, fromlist=["TOOL_SPEC"])
+            spec = getattr(module, "TOOL_SPEC", None)
+            if not spec:
+                continue
+            name = spec.get("name")
+            func = spec.get("func")
+            args = spec.get("args", {})
+            desc = spec.get("desc", "")
+            if name and callable(func):
+                tools[name] = func
+                manifest[name] = {"args": args, "desc": desc}
+    return tools, manifest
 
-def _tool_math_eval(expr: str) -> str:
-    import ast, operator as op
-    allowed = {ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul, ast.Div: op.truediv, ast.Pow: op.pow,
-               ast.USub: op.neg, ast.Mod: op.mod, ast.FloorDiv: op.floordiv}
-    def eval_(node):
-        if isinstance(node, ast.Num): return node.n
-        if isinstance(node, ast.UnaryOp) and type(node.op) in allowed: return allowed[type(node.op)](eval_(node.operand))
-        if isinstance(node, ast.BinOp) and type(node.op) in allowed: return allowed[type(node.op)](eval_(node.left), eval_(node.right))
-        raise ValueError("unsupported expression")
-    if "**" in expr and "e" in expr.lower():
-        raise ValueError("disallowed form")
-    node = ast.parse(expr, mode="eval").body
-    result = eval_(node)
-    if isinstance(result, (int, float)) and abs(result) > 1e12:
-        raise ValueError("result too large")
-    return str(result)
 
-def _tool_time_now() -> str:
-    return datetime.utcnow().isoformat() + "Z"
+TOOLS, _TOOL_MANIFEST = _load_tools()
 
-def _tool_text_regex_extract(pattern: str, text: str, limit: int = 10, flags: str = "") -> str:
-    fl = 0
-    if "i" in flags: fl |= re.IGNORECASE
-    if "m" in flags: fl |= re.MULTILINE
-    if "s" in flags: fl |= re.DOTALL
-    try:
-        rgx = re.compile(pattern, fl)
-        matches = rgx.findall(text)
-        if isinstance(matches, list):
-            matches = matches[:max(1, min(limit, 50))]
-            flat = []
-            for m in matches:
-                if isinstance(m, tuple):
-                    flat.append("".join(map(str, m)))
-                else:
-                    flat.append(str(m))
-            uniq, seen = [], set()
-            for x in flat:
-                if x not in seen:
-                    seen.add(x)
-                    uniq.append(x)
-            return json.dumps(uniq, ensure_ascii=False)
-        return "[]"
-    except Exception as e:
-        return json.dumps({"ok": False, "error": str(e)})
-
-def _tool_date_parse(text: str) -> str:
-    text = text.strip()
-    fmts = ["%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"]
-    for f in fmts:
-        try:
-            dt = datetime.strptime(text, f)
-            return dt.date().isoformat()
-        except Exception:
-            continue
-    try:
-        return datetime.fromisoformat(text).date().isoformat()
-    except Exception:
-        return json.dumps({"ok": False, "error": "unrecognized date"})
-
-TOOLS: Dict[str, Callable[..., str]] = {
-    "memory.search":      lambda **kw: _tool_memory_search(str(kw.get("query","")), int(kw.get("limit",3))),
-    "memory.note":        lambda **kw: _tool_memory_note(str(kw.get("text",""))),
-    "math.eval":          lambda **kw: _tool_math_eval(str(kw.get("expr","0"))),
-    "time.now":           lambda **kw: _tool_time_now(),
-    "text.regex_extract": lambda **kw: _tool_text_regex_extract(str(kw.get("pattern","")), str(kw.get("text","")), int(kw.get("limit",10)), str(kw.get("flags",""))),
-    "date.parse":         lambda **kw: _tool_date_parse(str(kw.get("text",""))),
-}
 
 def _tools_manifest() -> str:
-    return json.dumps({
-        "tools": {
-            "memory.search":      {"args": {"query": "string", "limit": "int"}, "desc": "search previous prompts/answers/notes (redacted)."},
-            "memory.note":        {"args": {"text": "string"}, "desc": "store a short note to memory."},
-            "math.eval":          {"args": {"expr": "string"}, "desc": "evaluate a safe arithmetic expression."},
-            "time.now":           {"args": {}, "desc": "UTC timestamp now."},
-            "text.regex_extract": {"args": {"pattern": "string", "text": "string", "limit":"int", "flags":"string"}, "desc": "regex matches as JSON list."},
-            "date.parse":         {"args": {"text": "string"}, "desc": "parse common date formats to ISO date."}
-        }
-    }, ensure_ascii=False)
+    return json.dumps({"tools": _TOOL_MANIFEST}, ensure_ascii=False)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Token budget + summarization
