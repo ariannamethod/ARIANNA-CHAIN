@@ -218,8 +218,10 @@ def quantize_2bit(model: nn.Module) -> None:
 # ────────────────────────────────────────────────────────────────────────────────
 class SelfMonitor:
     _snapshotted = False
-    def __init__(self, db_path: str = "arianna_memory.sqlite"):
+    def __init__(self, db_path: str = "arianna_memory.sqlite", use_embeddings: bool | None = None):
         self.conn = sqlite3.connect(db_path)
+        env_flag = os.getenv("ARIANNA_DISABLE_EMBED", "").lower() in {"1", "true", "yes"}
+        self.use_embeddings = use_embeddings if use_embeddings is not None else not env_flag
         self.embed_model = None
         self._init_db()
         if not SelfMonitor._snapshotted:
@@ -238,18 +240,37 @@ class SelfMonitor:
         root_path = Path(root)
         SKIP_DIRS = {".git", "__pycache__", "venv", "env", "logs", "node_modules", ".pytest_cache"}
         SKIP_SUFFIXES = {".sqlite", ".db", ".pdf", ".bin", ".pt", ".pth", ".zip", ".tar", ".png", ".jpg", ".jpeg", ".env", ".toml", ".yaml", ".yml"}
+        model = self._ensure_embed_model()
         for path in root_path.rglob("*"):
-            if not path.is_file(): continue
-            if any(part in SKIP_DIRS for part in path.parts): continue
-            if path.suffix.lower() in SKIP_SUFFIXES: continue
-            try: data = path.read_bytes()
-            except Exception: continue
-            if len(data) > 2_000_000: continue
+            if not path.is_file():
+                continue
+            if any(part in SKIP_DIRS for part in path.parts):
+                continue
+            if path.suffix.lower() in SKIP_SUFFIXES:
+                continue
+            try:
+                data = path.read_bytes()
+            except Exception:
+                continue
+            if len(data) > 2_000_000:
+                continue
             sha = hashlib.sha256(data).hexdigest()
             cur = self.conn.cursor()
-            cur.execute("INSERT OR REPLACE INTO files(path, content, sha256) VALUES (?,?,?)", (str(path), sqlite3.Binary(data), sha))
+            cur.execute(
+                "INSERT OR REPLACE INTO files(path, content, sha256) VALUES (?,?,?)",
+                (str(path), sqlite3.Binary(data), sha),
+            )
+            if model:
+                text = data.decode("utf-8", errors="ignore")
+                vec = model.encode([text])[0].astype("float32").tobytes()
+                cur.execute(
+                    "INSERT OR REPLACE INTO embeddings(sha256, embedding) VALUES (?,?)",
+                    (sha, sqlite3.Binary(vec)),
+                )
         self.conn.commit()
     def _ensure_embed_model(self):
+        if not self.use_embeddings:
+            return None
         if self.embed_model is None:
             try:
                 from sentence_transformers import SentenceTransformer
@@ -258,6 +279,7 @@ class SelfMonitor:
                 self.embed_model = SentenceTransformer(name)
             except Exception:
                 self.embed_model = None
+                self.use_embeddings = False
         return self.embed_model
 
     def log(self, prompt: str, output: str) -> None:
@@ -274,10 +296,16 @@ class SelfMonitor:
         cur.execute("INSERT INTO notes(ts, text) VALUES (?, ?)", (time.time(), text))
         cur.execute("INSERT INTO notes_index(text) VALUES (?)", (text,))
         self.conn.commit()
-    def _search_tfidf(self, query: str, limit: int = 5) -> list[tuple[str, str]]:
+    def _search_tfidf(self, query: str, limit: int = 5, return_scores: bool = False):
         cur = self.conn.cursor()
-        cur.execute("SELECT prompt, output FROM prompts_index WHERE prompts_index MATCH ? ORDER BY bm25(prompts_index) LIMIT ?", (query, limit))
-        return cur.fetchall()
+        cur.execute(
+            "SELECT prompt, output, bm25(prompts_index) as score FROM prompts_index WHERE prompts_index MATCH ? ORDER BY score LIMIT ?",
+            (query, limit),
+        )
+        rows = cur.fetchall()
+        if return_scores:
+            return [(p, o, 1 / (1 + s)) for p, o, s in rows]
+        return [(p, o) for p, o, _ in rows]
     def _search_notes(self, query: str, limit: int = 5) -> list[str]:
         cur = self.conn.cursor()
         cur.execute("SELECT text FROM notes_index WHERE notes_index MATCH ? ORDER BY bm25(notes_index) LIMIT ?", (query, limit))
@@ -287,9 +315,17 @@ class SelfMonitor:
         cur = self.conn.cursor()
         cur.execute("SELECT prompt, output FROM logs WHERE sha256 = ? LIMIT ?", (sha, limit))
         rows = cur.fetchall()
-        return rows or self._search_tfidf(prompt, limit=limit)
+        if rows:
+            return rows
+        scored: dict[tuple[str, str], float] = {}
+        for p, o, s in self._search_tfidf(prompt, limit=limit * 2, return_scores=True):
+            scored[(p, o)] = max(scored.get((p, o), 0.0), s)
+        for p, o, s in self.search_embedding(prompt, limit=limit * 2, return_scores=True):
+            scored[(p, o)] = max(scored.get((p, o), 0.0), s)
+        ordered = sorted(scored.items(), key=lambda kv: kv[1], reverse=True)
+        return [pair for pair, _ in ordered[:limit]]
 
-    def search_embedding(self, query: str, limit: int = 5) -> list[tuple[str, str]]:
+    def search_embedding(self, query: str, limit: int = 5, return_scores: bool = False):
         if not self._ensure_embed_model():
             return []
         qv = self.embed_model.encode([query])[0].astype("float32")
@@ -308,13 +344,16 @@ class SelfMonitor:
         q_norm = np.linalg.norm(qv) + 1e-9
         sims = (emb_matrix @ qv) / (np.linalg.norm(emb_matrix, axis=1) * q_norm + 1e-9)
         top_idx = np.argsort(-sims)[:limit]
-        out: list[tuple[str, str]] = []
+        out = []
         for i in top_idx:
             sha = sha_list[int(i)]
             cur.execute("SELECT prompt, output FROM logs WHERE sha256 = ? ORDER BY ts DESC LIMIT 1", (sha,))
             row = cur.fetchone()
             if row:
-                out.append(row)
+                if return_scores:
+                    out.append((row[0], row[1], float((sims[int(i)] + 1) / 2)))
+                else:
+                    out.append(row)
         return out
     def search_prompts_and_notes(self, query: str, limit: int = 5) -> list[str]:
         prs = self.search_embedding(query, limit=limit) or self._search_tfidf(query, limit=limit)
