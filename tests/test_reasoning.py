@@ -69,6 +69,24 @@ def test_reason_loop_alternates_and_logs() -> None:
     assert mock_log.call_args_list[1][0][0] == "<answer>"
 
 
+def test_reason_loop_beam_selects_highest_scoring() -> None:
+    """Multi-path mode should return highest scoring answer."""
+
+    responses = [
+        {"mode": "final", "think": "", "answer": "plain", "stop": True, "confidence": 0.7},
+        {"mode": "final", "think": "", "answer": "1. numbered", "stop": True, "confidence": 0.6},
+    ]
+
+    with (
+        patch("arianna_chain.call_liquid", side_effect=responses),
+        patch("arianna_chain.SelfMonitor.__init__", return_value=None),
+        patch("arianna_chain.SelfMonitor.log"),
+    ):
+        result = reason_loop("Q", max_steps=1, beams=2)
+
+    assert result == "1. numbered"
+
+
 def test_gsm8k_subset_accuracy() -> None:
     """Evaluate simple math questions and compute accuracy."""
 
