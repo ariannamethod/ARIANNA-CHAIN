@@ -1140,15 +1140,32 @@ def generate_text(
             prompt = f"{combined}\n\nCurrent:\n{prompt}"
     if use_liquid:
         try:
+            plan_obj = call_liquid(f"Plan the steps to answer: {prompt}", temperature=0.3)
+            plan = str(plan_obj.get("answer", ""))
             obj = call_liquid(prompt, temperature=0.3)
-            text = str(obj.get("answer", "")) or json.dumps(obj, ensure_ascii=False)
+            think = str(obj.get("think", ""))
+            answer = str(obj.get("answer", ""))
+            try:
+                verify_obj = call_liquid(
+                    f"Question: {prompt}\nAnswer: {answer}\nverify the previous answer",
+                    temperature=0.0,
+                )
+                verified = str(verify_obj.get("answer", ""))
+                if verified:
+                    answer = verified
+            except Exception:
+                pass
+            text = f"<plan>{plan}</plan>\n<think>{think}</think>\n<answer>{answer}</answer>"
             sm.log(prompt, text)
             tokens, entropy, perplexity = estimate_complexity_and_entropy(text)
             rec = thought_logger.log_turn(text, tokens, entropy, perplexity)
             if self_reflect:
                 crit = reflect(prompt, text, use_liquid=True)
                 if "good" not in crit.lower():
-                    repair = call_liquid(f"Revise using this critique. Return JSON. Draft: {text}\nCritique: {crit}", temperature=0.0)
+                    repair = call_liquid(
+                        f"Revise using this critique. Return JSON. Draft: {text}\nCritique: {crit}",
+                        temperature=0.0,
+                    )
                     text = str(repair.get("answer", text))
                     sm.log("revise", text)
             if log_reasoning:
