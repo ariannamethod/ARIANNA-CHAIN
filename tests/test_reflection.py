@@ -21,7 +21,15 @@ def _patch_env():
         patch("arianna_chain.quantize_2bit"),
         patch(
             "arianna_chain.thought_logger.log_turn",
-            return_value=SimpleNamespace(tokens=1, entropy=0.1, perplexity=None, timestamp="t"),
+            return_value=SimpleNamespace(
+                tokens=1,
+                entropy=0.1,
+                perplexity=None,
+                steps=0,
+                depth=0,
+                uniqueness=1.0,
+                timestamp="t",
+            ),
         ),
     )
 

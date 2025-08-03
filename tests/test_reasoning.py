@@ -100,7 +100,7 @@ def test_tree_reason_loop_selects_best_branch() -> None:
         patch("arianna_chain.reason_loop", side_effect=["bad", "good"]) as mock_loop,
         patch(
             "arianna_chain.estimate_complexity_and_entropy",
-            side_effect=lambda ans: (1, {"bad": 0.1, "good": 0.9}[ans]),
+            side_effect=lambda ans: (1, {"bad": 0.1, "good": 0.9}[ans], None, 0, 0, 1.0),
         ),
     ):
         result = tree_reason_loop("Q", beam_size=2, depth=1)

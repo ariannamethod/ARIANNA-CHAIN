@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import configparser
 import sqlite3
 import time
 import uuid
@@ -123,6 +124,14 @@ class ByteTokenizer:
 
 tokenizer = ByteTokenizer()
 
+_cfg = configparser.ConfigParser()
+_cfg.read(Path(__file__).with_name("setup.cfg"))
+_weights = _cfg["complexity_weights"] if _cfg.has_section("complexity_weights") else {}
+W_ENTROPY = float(os.getenv("AC_WEIGHT_ENTROPY", _weights.get("entropy", 1.0)))
+W_STEPS = float(os.getenv("AC_WEIGHT_STEPS", _weights.get("steps", 1.0)))
+W_DEPTH = float(os.getenv("AC_WEIGHT_DEPTH", _weights.get("depth", 1.0)))
+W_UNIQUENESS = float(os.getenv("AC_WEIGHT_UNIQUENESS", _weights.get("uniqueness", 1.0)))
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Complexity / entropy лог
 # ────────────────────────────────────────────────────────────────────────────────
@@ -133,6 +142,9 @@ class ThoughtLogEntry:
     tokens: int
     entropy: float
     perplexity: float | None = None
+    steps: int = 0
+    depth: int = 0
+    uniqueness: float = 0.0
 
 class ThoughtComplexityLogger:
     def __init__(self, log_file: str | Path = "logs/thought_log.jsonl") -> None:
@@ -146,6 +158,9 @@ class ThoughtComplexityLogger:
         tokens: int,
         entropy: float,
         perplexity: float | None = None,
+        steps: int = 0,
+        depth: int = 0,
+        uniqueness: float = 0.0,
     ) -> ThoughtLogEntry:
         entry = ThoughtLogEntry(
             timestamp=datetime.utcnow().isoformat() + "Z",
@@ -153,6 +168,9 @@ class ThoughtComplexityLogger:
             tokens=max(0, int(tokens)),
             entropy=float(entropy),
             perplexity=None if perplexity is None else float(perplexity),
+            steps=int(steps),
+            depth=int(depth),
+            uniqueness=float(uniqueness),
         )
         self.logs.append(entry)
         with self.log_file.open("a", encoding="utf-8") as f:
@@ -167,13 +185,15 @@ def estimate_complexity_and_entropy(
     model: Optional[nn.Module] = None,
     *,
     n: int = 2,
-) -> tuple[int, float, float | None]:
+) -> tuple[int, float, float | None, int, int, float]:
     tokens = tokenizer.encode(message)
+    flat = tokens.reshape(-1).tolist()
     token_count = len(tokens)
-    if token_count < n:
+    actual_count = len(flat)
+    if actual_count < n:
         n = 1
     counts: Counter[tuple[int, ...]] = Counter(
-        tuple(tokens[i : i + n]) for i in range(max(0, token_count - n + 1))
+        tuple(flat[i : i + n]) for i in range(max(0, actual_count - n + 1))
     )
     total = sum(counts.values())
     if total:
@@ -184,15 +204,42 @@ def estimate_complexity_and_entropy(
     else:
         entropy = 0.0
     perplexity = None
-    if model is not None and token_count > 1:
+    if model is not None and actual_count > 1:
         model.eval()
         with torch.no_grad():
-            inp = torch.tensor(tokens, dtype=torch.long).unsqueeze(0)
-            _, loss = model(inp[:, :-1], inp[:, 1:])
+            inp = torch.tensor(flat, dtype=torch.long).unsqueeze(0)
+            try:
+                output = model(inp[:, :-1], inp[:, 1:])
+                loss = output[1] if isinstance(output, (tuple, list)) and len(output) > 1 else None
+            except Exception:
+                loss = None
             if loss is not None:
                 perplexity = float(torch.exp(loss))
                 entropy /= max(perplexity, 1e-8)
-    return token_count, entropy, perplexity
+
+    steps = message.count("<think>")
+    depth = 0
+    list_re = re.compile(r"^(\s*)(?:\d+\.\s+|[-*]\s+)")
+    for line in message.splitlines():
+        m = list_re.match(line)
+        if m:
+            indent = len(m.group(1).replace("\t", "  "))
+            d = indent // 2 + 1
+            if d > depth:
+                depth = d
+    uniqueness = len(set(flat)) / actual_count if actual_count else 0.0
+
+    steps_score = min(steps / 10.0, 1.0)
+    depth_score = min(depth / 5.0, 1.0)
+    weighted = (
+        W_ENTROPY * entropy
+        + W_STEPS * steps_score
+        + W_DEPTH * depth_score
+        + W_UNIQUENESS * uniqueness
+    )
+    total_w = W_ENTROPY + W_STEPS + W_DEPTH + W_UNIQUENESS
+    score = weighted / total_w if total_w else 0.0
+    return token_count, score, perplexity, steps, depth, uniqueness
 
 thought_logger = ThoughtComplexityLogger()
 
@@ -936,8 +983,8 @@ def reason_loop(
             break
 
     text = final_answer or json.dumps(steps[-1], ensure_ascii=False)
-    tokens, entropy, perplexity = estimate_complexity_and_entropy(text)
-    thought_logger.log_turn(text, tokens, entropy, perplexity)
+    tokens, entropy, perplexity, steps, depth, uniq = estimate_complexity_and_entropy(text)
+    thought_logger.log_turn(text, tokens, entropy, perplexity, steps, depth, uniq)
     return text
 
 
@@ -1003,8 +1050,8 @@ def generate_text(
             obj = call_liquid(prompt, temperature=0.3)
             text = str(obj.get("answer", "")) or json.dumps(obj, ensure_ascii=False)
             sm.log(prompt, text)
-            tokens, entropy, perplexity = estimate_complexity_and_entropy(text)
-            rec = thought_logger.log_turn(text, tokens, entropy, perplexity)
+            tokens, entropy, perplexity, steps, depth, uniq = estimate_complexity_and_entropy(text)
+            rec = thought_logger.log_turn(text, tokens, entropy, perplexity, steps, depth, uniq)
             if self_reflect:
                 crit = reflect(prompt, text, use_liquid=True)
                 if "good" not in crit.lower():
@@ -1027,8 +1074,8 @@ def generate_text(
                     text = tokenizer.decode(out[0])
                     sm.log("revise", text)
             sm.log(prompt, text)
-            tokens, entropy, perplexity = estimate_complexity_and_entropy(text, model)
-            rec = thought_logger.log_turn(text, tokens, entropy, perplexity)
+            tokens, entropy, perplexity, steps, depth, uniq = estimate_complexity_and_entropy(text, model)
+            rec = thought_logger.log_turn(text, tokens, entropy, perplexity, steps, depth, uniq)
             if log_reasoning:
                 return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
             return text
@@ -1044,8 +1091,8 @@ def generate_text(
             text = tokenizer.decode(out[0])
             sm.log("revise", text)
     sm.log(prompt, text)
-    tokens, entropy, perplexity = estimate_complexity_and_entropy(text, model)
-    rec = thought_logger.log_turn(text, tokens, entropy, perplexity)
+    tokens, entropy, perplexity, steps, depth, uniq = estimate_complexity_and_entropy(text, model)
+    rec = thought_logger.log_turn(text, tokens, entropy, perplexity, steps, depth, uniq)
     if log_reasoning:
         return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
     return text
