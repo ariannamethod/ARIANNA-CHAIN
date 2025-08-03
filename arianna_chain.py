@@ -1,5 +1,4 @@
-# arianna_chain.py — клиент к серверу "liquid weights"
-# ReAct-граф + checkpoint-reflect + стагнация (cosine+text) + параллельные тулзы + критпроверка + verify-проход при low confidence
+# arianna_chain.py — "liquid weights"
 from __future__ import annotations
 
 import argparse
