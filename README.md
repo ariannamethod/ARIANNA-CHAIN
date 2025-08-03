@@ -1,4 +1,4 @@
-# Arianna-C
+# ARIANNA CHAIN
 
 Arianna‑C ("Arianna Chain") is an autonomous reasoning system engineered for deterministic CPU execution. It centers on an enhanced **DeepSeek R1** reasoning core that we refined with a stricter reflection loop, 2‑bit W2A8 quantized linears, and a secure byte-level tokenizer. The engine preserves the `<think>`/`<answer>` protocol of its DeepSeek ancestor yet operates entirely offline without external services.
 
