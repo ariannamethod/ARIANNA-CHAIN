@@ -129,20 +129,29 @@ tokenizer = ByteTokenizer()
 class ThoughtLogEntry:
     timestamp: str
     message: str
-    complexity: int
+    tokens: int
     entropy: float
+    perplexity: float | None = None
 
 class ThoughtComplexityLogger:
     def __init__(self, log_file: str | Path = "logs/thought_log.jsonl") -> None:
         self.log_file = Path(log_file)
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
         self.logs: List[ThoughtLogEntry] = []
-    def log_turn(self, message: str, complexity_scale: int, entropy: float) -> ThoughtLogEntry:
+
+    def log_turn(
+        self,
+        message: str,
+        tokens: int,
+        entropy: float,
+        perplexity: float | None = None,
+    ) -> ThoughtLogEntry:
         entry = ThoughtLogEntry(
             timestamp=datetime.utcnow().isoformat() + "Z",
             message=message,
-            complexity=max(1, min(5, complexity_scale)),
-            entropy=float(min(1.0, max(0.0, entropy))),
+            tokens=max(0, int(tokens)),
+            entropy=float(entropy),
+            perplexity=None if perplexity is None else float(perplexity),
         )
         self.logs.append(entry)
         with self.log_file.open("a", encoding="utf-8") as f:
@@ -151,17 +160,38 @@ class ThoughtComplexityLogger:
     def recent(self, n: int = 7) -> List[ThoughtLogEntry]:
         return self.logs[-n:]
 
-def estimate_complexity_and_entropy(message: str) -> tuple[int, float]:
-    complexity = 1
-    lowered = message.lower()
-    if any(k in lowered for k in ("why", "почему", "paradox", "recursive", "<think>", "plan", "reflect")):
-        complexity += 2
-    if len(message) > 300:
-        complexity += 1
-    complexity = max(1, min(5, complexity))
-    unique_words = len(set(message.split()))
-    entropy = min(1.0, unique_words / 40.0)
-    return complexity, entropy
+
+def estimate_complexity_and_entropy(
+    message: str,
+    model: Optional[nn.Module] = None,
+    *,
+    n: int = 2,
+) -> tuple[int, float, float | None]:
+    tokens = tokenizer.encode(message)
+    token_count = len(tokens)
+    if token_count < n:
+        n = 1
+    counts: Counter[tuple[int, ...]] = Counter(
+        tuple(tokens[i : i + n]) for i in range(max(0, token_count - n + 1))
+    )
+    total = sum(counts.values())
+    if total:
+        probs = [c / total for c in counts.values()]
+        entropy = -sum(p * math.log2(p) for p in probs)
+        max_entropy = math.log2(len(counts)) if counts else 1.0
+        entropy = entropy / max_entropy if max_entropy else 0.0
+    else:
+        entropy = 0.0
+    perplexity = None
+    if model is not None and token_count > 1:
+        model.eval()
+        with torch.no_grad():
+            inp = torch.tensor(tokens, dtype=torch.long).unsqueeze(0)
+            _, loss = model(inp[:, :-1], inp[:, 1:])
+            if loss is not None:
+                perplexity = float(torch.exp(loss))
+                entropy /= max(perplexity, 1e-8)
+    return token_count, entropy, perplexity
 
 thought_logger = ThoughtComplexityLogger()
 
@@ -861,8 +891,8 @@ def reason_loop(
             break
 
     text = final_answer or json.dumps(steps[-1], ensure_ascii=False)
-    complexity, entropy = estimate_complexity_and_entropy(text)
-    thought_logger.log_turn(text, complexity, entropy)
+    tokens, entropy, perplexity = estimate_complexity_and_entropy(text)
+    thought_logger.log_turn(text, tokens, entropy, perplexity)
     return text
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -904,8 +934,8 @@ def generate_text(
             obj = call_liquid(prompt, temperature=0.3)
             text = str(obj.get("answer", "")) or json.dumps(obj, ensure_ascii=False)
             sm.log(prompt, text)
-            complexity, entropy = estimate_complexity_and_entropy(text)
-            rec = thought_logger.log_turn(text, complexity, entropy)
+            tokens, entropy, perplexity = estimate_complexity_and_entropy(text)
+            rec = thought_logger.log_turn(text, tokens, entropy, perplexity)
             if self_reflect:
                 crit = reflect(prompt, text, use_liquid=True)
                 if "good" not in crit.lower():
@@ -913,7 +943,7 @@ def generate_text(
                     text = str(repair.get("answer", text))
                     sm.log("revise", text)
             if log_reasoning:
-                return text, {"complexity": rec.complexity, "entropy": rec.entropy, "timestamp": rec.timestamp}
+                return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
             return text
         except Exception:
             model = AriannaC(AriannaCConfig())
@@ -928,10 +958,10 @@ def generate_text(
                     text = tokenizer.decode(out[0])
                     sm.log("revise", text)
             sm.log(prompt, text)
-            complexity, entropy = estimate_complexity_and_entropy(text)
-            rec = thought_logger.log_turn(text, complexity, entropy)
+            tokens, entropy, perplexity = estimate_complexity_and_entropy(text, model)
+            rec = thought_logger.log_turn(text, tokens, entropy, perplexity)
             if log_reasoning:
-                return text, {"complexity": rec.complexity, "entropy": rec.entropy, "timestamp": rec.timestamp}
+                return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
             return text
     model = AriannaC(AriannaCConfig())
     idx = tokenizer.encode(prompt)
@@ -945,10 +975,10 @@ def generate_text(
             text = tokenizer.decode(out[0])
             sm.log("revise", text)
     sm.log(prompt, text)
-    complexity, entropy = estimate_complexity_and_entropy(text)
-    rec = thought_logger.log_turn(text, complexity, entropy)
+    tokens, entropy, perplexity = estimate_complexity_and_entropy(text, model)
+    rec = thought_logger.log_turn(text, tokens, entropy, perplexity)
     if log_reasoning:
-        return text, {"complexity": rec.complexity, "entropy": rec.entropy, "timestamp": rec.timestamp}
+        return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
     return text
 
 def generate_with_think(
@@ -1044,7 +1074,7 @@ def main() -> None:
             if args.verbose:
                 text, meta = result  # type: ignore[assignment]
                 print(text)
-                print(f"LOG@{meta['timestamp']} | Complexity: {meta['complexity']} | Entropy: {meta['entropy']:.2f}")
+                print(f"LOG@{meta['timestamp']} | Tokens: {meta['tokens']} | Entropy: {meta['entropy']:.2f}")
             else:
                 print(result)
 
