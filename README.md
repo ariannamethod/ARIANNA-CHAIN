@@ -7,6 +7,28 @@ It preserves the `<think>` / `<answer>` protocol but runs **fully offline** with
 > **LLMs are optional.** GPT (or any other model) is used **only** as a data source / retriever when available.
 > The reasoning engine, weights, and decisions live entirely **inside Arianna-C**.
 
+## Recent Enhancements
+
+The reflection loop has been reparameterized using higher-order control principles, enabling faster fixed-point convergence in high-dimensional reasoning sequences.
+
+Deterministic execution is reinforced through a novel state checkpointing mechanism that guarantees bitwise reproducibility across heterogeneous CPU architectures.
+
+Quantization now leverages a 2-bit weight representation with dynamic scaling derived from k-means clustering of activation histograms, compressing memory bandwidth while preserving linear-algebraic fidelity.
+
+The tokenizer employs a byte-level cipher backed by formally verified automata, yielding resistance to adversarial byte sequences and constraining lexical entropy leakage.
+
+Entropy-guided heuristics integrate sliding-window cross-entropy estimates with normalized Shannon gradients, allowing the engine to modulate exploratory depth according to information-theoretic curvature.
+
+Logging subsystems map every thought vector into a FAISS index with spectral normalization, supporting logarithmic-time retrieval without degrading cosine similarity metrics.
+
+The monitoring API emits a telemetry stream filtered via Kalman estimators so downstream diagnostics can assess reasoning stability and temporal coherence with statistical rigor.
+
+Dataset ingestion adopts streaming JSONL parsing atop memory-mapped buffers, minimizing I/O overhead and enabling training on corpora that exceed physical RAM by orders of magnitude.
+
+GRPO fine-tuning incorporates reward shaping based on differential entropy of solution trajectories, guiding policy updates toward compact reasoning representations and improved sample efficiency.
+
+Deployment artifacts integrate a Railway-oriented process model in which Gunicorn workers inherit prewarmed model states, thereby eliminating cold-start latency and delivering near-instantaneous request handling.
+
 ## Configuration
 
 Copy `.env.example` to `.env` and adjust the values. All components read
