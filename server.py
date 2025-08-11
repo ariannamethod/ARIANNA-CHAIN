@@ -45,6 +45,11 @@ _file_handler.addFilter(logger.handlers[0].filters[0])
 logger.addHandler(_file_handler)
 app.logger = logger
 
+
+@app.before_request
+def _log_request() -> None:
+    app.logger.info("%s %s", request.method, request.path)
+
 if not settings.openai_api_key:
     app.logger.critical("OPENAI_API_KEY не задан — выход")
     raise RuntimeError("OPENAI_API_KEY is required")
@@ -90,6 +95,7 @@ def require_auth(fn: Callable):
         if secret:
             token = _extract_auth_token()
             if token != secret:
+                app.logger.warning("unauthorized access to %s", request.path)
                 return jsonify({"error": "unauthorized"}), 401
         return fn(*args, **kwargs)
     return inner
