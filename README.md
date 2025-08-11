@@ -4,8 +4,15 @@
 At its core is an improved **DeepSeek R1**-style engine with a tighter reflection loop, **2-bit (W2A8) quantized** linear layers, and a **secure byte-level tokenizer**.  
 It preserves the `<think>` / `<answer>` protocol but runs **fully offline** without external services.
 
-> **LLMs are optional.** GPT (or any other model) is used **only** as a data source / retriever when available.  
+> **LLMs are optional.** GPT (or any other model) is used **only** as a data source / retriever when available.
 > The reasoning engine, weights, and decisions live entirely **inside Arianna-C**.
+
+## Configuration
+
+Copy `.env.example` to `.env` and adjust the values. All components read
+configuration through `arianna_core.config.Settings`, so environment variables
+are validated at startup instead of being accessed with `os.getenv` throughout
+the codebase.
 
 ---
 
@@ -23,14 +30,18 @@ Every thought is logged to a **FAISS** vector store (retrieval-augmented reasoni
 
 ## Deployment (Railway)
 
-Use the included `Procfile`. Set env vars:
+Use the included `Procfile`. Set env vars (or create a `.env` file):
 
-OPENAI_API_KEY=…        # optional, for data retrieval only
-ARIANNA_SERVER_TOKEN=…  # optional auth
+```
+OPENAI_API_KEY=...
+ARIANNA_SERVER_TOKEN=...
+```
 
 Then:
 
+```
 railway up
+```
 
 `server.py` binds Gunicorn to Railway’s `PORT` and exposes:
 

@@ -2,11 +2,11 @@
 
 import asyncio
 import logging
-import os
 import re
 
 from arianna_chain import generate_text
 from arianna_core import SelfMonitor
+from arianna_core.config import settings
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -40,7 +40,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def main() -> None:
-    token = os.getenv("TELEGRAM_TOKEN")
+    token = settings.telegram_token
     if not token:
         raise RuntimeError("TELEGRAM_TOKEN is required")
     app = ApplicationBuilder().token(token).build()

@@ -1,11 +1,11 @@
 import json
 import logging
-import os
 import threading
 import time
 from typing import Any, Dict, Generator, Iterable, Optional, Tuple
 
 import requests
+from .config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -95,15 +95,15 @@ class HTTPClient:
 # ---- Liquid server wrappers ---------------------------------------------------
 
 def _srv() -> str:
-    return os.getenv("ARIANNA_SERVER_URL", "http://127.0.0.1:8000/generate")
+    return settings.arianna_server_url
 
 
 def _srv_sse() -> str:
-    return os.getenv("ARIANNA_SERVER_SSE_URL", "http://127.0.0.1:8000/generate_sse")
+    return settings.arianna_server_sse_url
 
 
 def _token() -> Optional[str]:
-    return os.getenv("ARIANNA_SERVER_TOKEN")
+    return settings.arianna_server_token or None
 
 
 class _HTTP:
