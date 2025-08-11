@@ -15,6 +15,8 @@ import logging
 import threading
 import hashlib
 import re
+import base64
+import string
 from typing import Dict, Any, Callable, Generator, Tuple, Optional
 from logging.handlers import RotatingFileHandler
 from functools import wraps
@@ -319,11 +321,32 @@ def _pick_model(prompt: str, fallback: str) -> str:
         return MODEL_HEAVY
     return MODEL_LIGHT or fallback
 
+BASE64_MIN_LEN = 200
+BASE64_MAX_LEN = 8_192
+BASE64_CHARS = set(string.ascii_letters + string.digits + "+/=")
+
+
 def _sanitize_prompt(prompt: str, limit: int = PROMPT_LIMIT_CHARS) -> str:
     prompt = prompt.strip()
     if len(prompt) > limit:
         prompt = prompt[:limit] + f"\n\n[truncated at {limit} chars]"
-    prompt = re.sub(r"[A-Za-z0-9+/]{200,}={0,2}", "[BASE64_REDACTED]", prompt)
+
+    parts = re.split(r"(\s+)", prompt)
+
+    for i in range(0, len(parts), 2):
+        token = parts[i]
+        if len(token) < BASE64_MIN_LEN or any(ch not in BASE64_CHARS for ch in token):
+            continue
+        if len(token) > BASE64_MAX_LEN:
+            parts[i] = "[BASE64_REDACTED]"
+            continue
+        try:
+            base64.b64decode(token, validate=True)
+            parts[i] = "[BASE64_REDACTED]"
+        except Exception:
+            pass
+
+    prompt = "".join(parts)
     prompt = _truncate_large_code_blocks(prompt)
     return prompt
 
