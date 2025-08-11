@@ -45,6 +45,16 @@ def _tuple(v: str) -> Tuple[str, ...]:
     return tuple(x.strip() for x in v.split(";") if x.strip())
 
 
+def _railway_default(path: str) -> str:
+    """Return default server URL, respecting Railway deployment."""
+    domain = _get_env("RAILWAY_PUBLIC_DOMAIN", None)
+    if domain:
+        if not domain.startswith("http://") and not domain.startswith("https://"):
+            domain = f"https://{domain}"
+        return f"{domain.rstrip('/')}{path}"
+    return f"http://127.0.0.1:8000{path}"
+
+
 @dataclass(frozen=True)
 class Settings:
     """Container for environment configuration."""
@@ -60,12 +70,12 @@ class Settings:
     )
     arianna_server_url: str = field(
         default_factory=lambda: _get_env(
-            "ARIANNA_SERVER_URL", "http://127.0.0.1:8000/generate"
+            "ARIANNA_SERVER_URL", _railway_default("/generate")
         )
     )
     arianna_server_sse_url: str = field(
         default_factory=lambda: _get_env(
-            "ARIANNA_SERVER_SSE_URL", "http://127.0.0.1:8000/generate_sse"
+            "ARIANNA_SERVER_SSE_URL", _railway_default("/generate_sse")
         )
     )
     telegram_token: str | None = field(
