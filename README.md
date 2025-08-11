@@ -4,8 +4,50 @@
 At its core is an improved **DeepSeek R1**-style engine with a tighter reflection loop, **2-bit (W2A8) quantized** linear layers, and a **secure byte-level tokenizer**.  
 It preserves the `<think>` / `<answer>` protocol but runs **fully offline** without external services.
 
-> **LLMs are optional.** GPT (or any other model) is used **only** as a data source / retriever when available.  
+> **LLMs are optional.** GPT (or any other model) is used **only** as a data source / retriever when available.
 > The reasoning engine, weights, and decisions live entirely **inside Arianna-C**.
+
+---
+
+## Quick Start
+
+1. **Clone the repository**
+
+   ```bash
+   git clone https://github.com/your-org/ARIANNA-CHAIN.git
+   cd ARIANNA-CHAIN
+   ```
+
+2. **Install dependencies**
+
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
+
+3. **Configure environment variables**
+
+   ```bash
+   cp env.example .env  # then edit .env with your values
+   # or export manually
+   export OPENAI_API_KEY=...
+   export ARIANNA_SERVER_TOKEN=...
+   ```
+
+4. **Run tests**
+
+   ```bash
+   pytest
+   ```
+
+5. **Start the server**
+
+   ```bash
+   python server.py
+   ```
+
+   The API will be available at `http://localhost:8000`.
 
 ---
 
@@ -51,19 +93,43 @@ railway up
 
 ## Usage
 
+### Basic CLI
+
 ```bash
 python arianna_chain.py "2+2="
+```
 
-Streaming SSE Events
+### CLI examples
+
+```bash
+# show reasoning log
+python arianna_chain.py --verbose "2+2="
+
+# run multi-step reasoning
+python arianna_chain.py --max-steps 3 "fibonacci 10"
+```
+
+### Using SelfMonitor
+
+```python
+from arianna_chain import generate_text
+from arianna_core import SelfMonitor
+
+with SelfMonitor() as monitor:
+    result = generate_text("2+2=", monitor=monitor)
+    print(result)
+```
+
+### Streaming SSE Events
 
 During generation the server emits:
-	•	plan.delta — incremental planning text
-	•	reasoning.delta — chain-of-thought fragments
-	•	repair.delta — self-repair snippets
-	•	response.output_text.delta — answer chunks
-	•	response.completed — final payload
-	•	ping — heartbeat
-	•	response.error — error details
+        •       plan.delta — incremental planning text
+        •       reasoning.delta — chain-of-thought fragments
+        •       repair.delta — self-repair snippets
+        •       response.output_text.delta — answer chunks
+        •       response.completed — final payload
+        •       ping — heartbeat
+        •       response.error — error details
 
 ⸻
 
