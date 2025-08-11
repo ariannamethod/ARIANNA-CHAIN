@@ -9,7 +9,6 @@
 import os
 import json
 import time
-import uuid
 import random
 import logging
 import threading
@@ -19,20 +18,23 @@ import base64
 import string
 from typing import Dict, Any, Callable, Generator, Tuple, Optional
 from logging.handlers import RotatingFileHandler
-from functools import wraps
 from collections import OrderedDict
 
-from flask import Flask, request, jsonify, Response, make_response
+from flask import Flask, request, jsonify, Response, make_response, g
 from openai import OpenAI
 
 from arianna_core.config import settings
+from .config import settings as server_settings
+from .security import limiter, security_bp
 
 app = Flask(__name__)
+app.register_blueprint(security_bp)
+app.config["MAX_CONTENT_LENGTH"] = server_settings.request_max_bytes
 
-LOG_DIR = os.path.join("logs", "server")
+LOG_DIR = server_settings.log_dir
 os.makedirs(LOG_DIR, exist_ok=True)
 handler = RotatingFileHandler(
-    os.path.join(LOG_DIR, "server.log"),
+    os.path.join(LOG_DIR, server_settings.log_file),
     maxBytes=2_000_000,
     backupCount=3,
     encoding="utf-8",
@@ -48,7 +50,6 @@ if not settings.openai_api_key:
 # ────────────────────────────────────────────────────────────────────────────────
 # Конфиг
 # ────────────────────────────────────────────────────────────────────────────────
-SECRET               = settings.arianna_server_token
 MODEL_DEFAULT        = settings.arianna_model
 MODEL_LIGHT          = settings.arianna_model_light or MODEL_DEFAULT
 MODEL_HEAVY          = settings.arianna_model_heavy or MODEL_DEFAULT
@@ -59,92 +60,11 @@ PROMPT_LIMIT_CHARS   = settings.prompt_limit_chars
 CACHE_TTL            = settings.cache_ttl_seconds
 CACHE_MAX            = settings.cache_max_items
 SCHEMA_VERSION       = settings.schema_version
-RATE_CAPACITY        = settings.rate_capacity
-RATE_REFILL_PER_SEC  = settings.rate_refill_per_sec
-RATE_STATE_TTL       = settings.rate_state_ttl
-RATE_STATE_CLEANUP   = settings.rate_state_cleanup
 HEARTBEAT_EVERY      = settings.sse_heartbeat_every
 TIME_PING_SECONDS    = settings.sse_time_heartbeat_sec
 TIME_SENSITIVE_HINTS = ("now", "today", "сейчас", "сегодня", "latest", "свеж", "текущ")
 CODE_BLOCK_LIMIT     = settings.code_block_limit
 SIMHASH_HAMMING_THR  = settings.simhash_hamming_thr
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Авторизация
-# ────────────────────────────────────────────────────────────────────────────────
-def _extract_auth_token() -> str:
-    auth = request.headers.get("Authorization", "")
-    if auth.lower().startswith("bearer "):
-        return auth.split(None, 1)[1].strip()
-    return request.headers.get("X-Auth-Token", "").strip()
-
-def require_auth(fn: Callable):
-    @wraps(fn)
-    def inner(*args, **kwargs):
-        if SECRET:
-            token = _extract_auth_token()
-            if token != SECRET:
-                return jsonify({"error": "unauthorized"}), 401
-        return fn(*args, **kwargs)
-    return inner
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Leaky-bucket rate-limiter
-# ────────────────────────────────────────────────────────────────────────────────
-class RateLimiter:
-    def __init__(self, capacity: int, refill_per_sec: float, state_ttl: int, cleanup_threshold: int):
-        self.capacity, self.refill = capacity, refill_per_sec
-        self.state: Dict[str, Tuple[float, float]] = {}
-        self.lock = threading.Lock()
-        self.ttl = state_ttl
-        self._cleanup_threshold = cleanup_threshold
-        self._cleanup_running = False
-
-    def _cleanup(self):
-        now = time.time()
-        with self.lock:
-            stale = [k for k, (_, last) in self.state.items() if now - last > self.ttl]
-            for k in stale:
-                self.state.pop(k, None)
-            self._cleanup_running = False
-
-    def allow(self, key: str) -> bool:
-        now = time.time()
-        start_cleanup = False
-        with self.lock:
-            tokens, last = self.state.get(key, (self.capacity, now))
-            if now - last > self.ttl:
-                self.state.pop(key, None)
-                tokens, last = self.capacity, now
-            tokens = min(self.capacity, tokens + (now - last) * self.refill)
-            if tokens < 1.0:
-                self.state[key] = (tokens, now)
-                return False
-            self.state[key] = (tokens - 1.0, now)
-            if len(self.state) > self._cleanup_threshold and not self._cleanup_running:
-                self._cleanup_running = True
-                start_cleanup = True
-        if start_cleanup:
-            threading.Thread(target=self._cleanup, daemon=True).start()
-        return True
-
-    def remaining(self, key: str) -> int:
-        now = time.time()
-        with self.lock:
-            tokens, last = self.state.get(key, (self.capacity, now))
-            tokens = min(self.capacity, tokens + (now - last) * self.refill)
-            return int(tokens)
-
-def _client_key() -> str:
-    xff = request.headers.get("X-Forwarded-For", "")
-    if xff:
-        return xff.split(",")[0].strip()
-    tok = _extract_auth_token()
-    if tok:
-        return tok
-    return request.remote_addr or "unknown"
-
-limiter = RateLimiter(RATE_CAPACITY, RATE_REFILL_PER_SEC, RATE_STATE_TTL, RATE_STATE_CLEANUP)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # LRU + TTL Cache (+ SimHash near-dup search)
@@ -630,15 +550,13 @@ def health():
 # /generate (sync)
 # ────────────────────────────────────────────────────────────────────────────────
 @app.post("/generate")
-@require_auth
 def generate():
-    req_id = uuid.uuid4().hex
-    key_id = _client_key()
+    req_id = g.req_id
+    key_id = g.key_id
     t0 = time.time()
     if not limiter.allow(key_id):
         r = make_response(jsonify({"error": "rate_limited", "req_id": req_id}), 429)
         r.headers["Retry-After"] = "2"
-        r.headers["X-Req-Id"] = req_id
         r.headers["X-Schema-Version"] = SCHEMA_VERSION
         r.headers["X-Cache"] = "MISS"
         r.headers["X-RateLimit-Remaining"] = str(limiter.remaining(key_id))
@@ -647,10 +565,16 @@ def generate():
     try:
         payload = request.get_json(force=True) or {}
         prompt_raw = str(payload.get("prompt", ""))
+        if len(prompt_raw) > PROMPT_LIMIT_CHARS:
+            r = make_response(jsonify({"error": "prompt too long", "req_id": req_id}), 400)
+            r.headers["X-Schema-Version"] = SCHEMA_VERSION
+            r.headers["X-Cache"] = "MISS"
+            r.headers["X-RateLimit-Remaining"] = str(limiter.remaining(key_id))
+            r.headers["X-Model"] = MODEL_DEFAULT
+            return r
         prompt = _sanitize_prompt(prompt_raw)
         if not prompt:
             r = make_response(jsonify({"error": "empty prompt", "req_id": req_id}), 400)
-            r.headers["X-Req-Id"] = req_id
             r.headers["X-Schema-Version"] = SCHEMA_VERSION
             r.headers["X-Cache"] = "MISS"
             r.headers["X-RateLimit-Remaining"] = str(limiter.remaining(key_id))
@@ -678,14 +602,13 @@ def generate():
 
         if cached:
             latency = int((time.time() - t0) * 1000)
-            r = make_response(jsonify({"response": cached, "req_id": req_id, "latency_ms": latency}), 200)
-            r.headers["X-Req-Id"] = req_id
-            r.headers["X-Schema-Version"] = SCHEMA_VERSION
-            r.headers["X-Cache"] = "HIT"
-            r.headers["X-RateLimit-Remaining"] = str(limiter.remaining(key_id))
-            r.headers["X-Time-Sensitive"] = "1" if time_sensitive else "0"
-            r.headers["X-Model"] = model
-            return r
+        r = make_response(jsonify({"response": cached, "req_id": req_id, "latency_ms": latency}), 200)
+        r.headers["X-Schema-Version"] = SCHEMA_VERSION
+        r.headers["X-Cache"] = "HIT"
+        r.headers["X-RateLimit-Remaining"] = str(limiter.remaining(key_id))
+        r.headers["X-Time-Sensitive"] = "1" if time_sensitive else "0"
+        r.headers["X-Model"] = model
+        return r
 
         def _call_once():
             obj, usage, oid = _responses_create(prompt, model=model, temperature=temperature, top_p=top_p)
@@ -718,7 +641,6 @@ def generate():
             "model": model
         })
         r = make_response(jsonify({"response": obj, "req_id": req_id, "latency_ms": latency}), 200)
-        r.headers["X-Req-Id"] = req_id
         r.headers["X-Schema-Version"] = SCHEMA_VERSION
         r.headers["X-Cache"] = "MISS"
         r.headers["X-RateLimit-Remaining"] = str(limiter.remaining(key_id))
@@ -729,7 +651,6 @@ def generate():
     except Exception as e:
         app.logger.exception("generate failed")
         r = make_response(jsonify({"error": str(e), "req_id": req_id}), 500)
-        r.headers["X-Req-Id"] = req_id
         r.headers["X-Schema-Version"] = SCHEMA_VERSION
         r.headers["X-Cache"] = "MISS"
         r.headers["X-RateLimit-Remaining"] = str(limiter.remaining(key_id))
@@ -740,10 +661,9 @@ def generate():
 # /generate_sse
 # ────────────────────────────────────────────────────────────────────────────────
 @app.post("/generate_sse")
-@require_auth
 def generate_sse():
-    req_id = uuid.uuid4().hex
-    key_id = _client_key()
+    req_id = g.req_id
+    key_id = g.key_id
     if not limiter.allow(key_id):
         body = (
             "retry: 10000\n\n"
@@ -755,7 +675,6 @@ def generate_sse():
             "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
-            "X-Req-Id": req_id,
             "X-Schema-Version": SCHEMA_VERSION,
             "X-RateLimit-Remaining": str(limiter.remaining(key_id)),
             "X-Model": MODEL_DEFAULT,
@@ -763,7 +682,13 @@ def generate_sse():
         return Response(body, headers=headers)
     try:
         payload = request.get_json(force=True) or {}
-        prompt = _sanitize_prompt(str(payload.get("prompt", "")))
+        prompt_raw = str(payload.get("prompt", ""))
+        if len(prompt_raw) > PROMPT_LIMIT_CHARS:
+            return Response(
+                f"event: response.error\ndata: {json.dumps({'error':'prompt too long','req_id':req_id})}\n\n",
+                mimetype="text/event-stream",
+            )
+        prompt = _sanitize_prompt(prompt_raw)
         if not prompt:
             return Response(
                 f"event: response.error\ndata: {json.dumps({'error':'empty prompt','req_id':req_id})}\n\n",
@@ -790,7 +715,6 @@ def generate_sse():
             "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
-            "X-Req-Id": req_id,
             "X-Schema-Version": SCHEMA_VERSION,
             "X-Time-Sensitive": "1" if time_sensitive else "0",
             "X-RateLimit-Remaining": str(limiter.remaining(key_id)),
