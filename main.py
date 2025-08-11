@@ -1,12 +1,11 @@
 """Telegram bot interface for Arianna Chain via internal server."""
-
 import asyncio
 import logging
 import re
 
-from arianna_chain import generate_text
 from arianna_core import SelfMonitor
 from arianna_core.config import settings
+from arianna_core.http import call_liquid
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -25,14 +24,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send the user's message to Arianna-C and return the answer."""
+    """Send the user's message to Arianna-C server and return the answer."""
     prompt = update.message.text or ""
     try:
         with SelfMonitor() as sm:
-            result = await asyncio.to_thread(generate_text, prompt, monitor=sm)
-        text = result[0] if isinstance(result, tuple) else result
+            result = await asyncio.to_thread(call_liquid, prompt)
+            plan = result.get("plan", "")
+            think = result.get("think", "")
+            answer = result.get("answer", "")
+            text = f"<plan>{plan}</plan>\n<think>{think}</think>\n<answer>{answer}</answer>"
+            sm.log(prompt, text)
         match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
-        reply = (match.group(1).strip() if match else text.strip()) or "(пустой ответ)"
+        reply = (match.group(1).strip() if match else answer.strip()) or "(пустой ответ)"
         await update.message.reply_text(reply)
     except Exception as exc:  # pragma: no cover
         logging.exception("Arianna chain request failed")
@@ -47,6 +50,7 @@ async def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     await app.run_polling()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
