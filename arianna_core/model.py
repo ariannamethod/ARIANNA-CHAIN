@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -84,8 +84,8 @@ class LinearW2A8(nn.Module):
         self.register_buffer("scales", torch.empty(0, dtype=torch.float32), persistent=True)
         self.register_buffer("zps", torch.empty(0, dtype=torch.uint8), persistent=True)
         self.register_buffer("cols_padded", torch.tensor(0, dtype=torch.int32), persistent=True)
+        self.register_buffer("w_cache", torch.empty(0, dtype=torch.float32), persistent=False)
         self.cache_groups = int(cache_groups)
-        self._unpacked_cache: Dict[int, torch.Tensor] = {}
         self._g_lens: List[int] = []
 
     @staticmethod
@@ -112,6 +112,7 @@ class LinearW2A8(nn.Module):
         zps = []
         self._g_lens = []
         w_cpu = weight.detach().to(torch.float32).cpu()
+        w_cache = torch.empty((out, in_f), dtype=torch.float32)
         for g in range(n_groups):
             j0 = g * G
             j1 = min((g + 1) * G, in_f)
@@ -124,6 +125,8 @@ class LinearW2A8(nn.Module):
             codes_packed.append(pk)
             scales.append(sc.unsqueeze(1))
             zps.append(zp.to(torch.uint8).unsqueeze(1))
+            rec = (q.to(torch.int16) - zp.to(torch.int16).unsqueeze(-1)).to(torch.float32) * sc.unsqueeze(-1)
+            w_cache[:, j0:j1] = rec[:, : (j1 - j0)]
         self.w_packed = (
             torch.cat(codes_packed, dim=1).contiguous() if codes_packed else torch.empty((out, 0), dtype=torch.uint8)
         )
@@ -139,41 +142,12 @@ class LinearW2A8(nn.Module):
         if self.bias is not None and bias is not None:
             with torch.no_grad():
                 self.bias.copy_(bias.to(self.bias.dtype))
-        self._unpacked_cache.clear()
-
-    def _group_slice_packed(self, g: int) -> torch.Tensor:
-        g_len_real = self._g_lens[g]
-        bytes_g = ((g_len_real + 3) // 4)
-        start = sum(((length + 3) // 4) for length in self._g_lens[:g])
-        return self.w_packed[:, start : start + bytes_g]
-
-    def _get_centered_scaled_group(self, g: int, device: torch.device) -> torch.Tensor:
-        if self.cache_groups and (g in self._unpacked_cache):
-            return self._unpacked_cache[g].to(device, non_blocking=True)
-        pk = self._group_slice_packed(g)
-        g_len_real = self._g_lens[g]
-        q = _unpack2(pk, (g_len_real + 3) // 4 * 4)[:, :g_len_real]
-        zp = self.zps[:, g].to(torch.int16)[:, None]
-        sc = self.scales[:, g].to(torch.float32)[:, None]
-        w_g = (q.to(torch.int16) - zp).to(torch.float32) * sc
-        w_g = w_g.to(device)
-        if self.cache_groups:
-            self._unpacked_cache[g] = w_g.detach().cpu()
-        return w_g
+        self.w_cache = w_cache
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dim() == 2 and x.size(1) == self.in_features
-        B = x.size(0)
-        device = x.device
-        y = torch.zeros((B, self.out_features), dtype=torch.float32, device=device)
-        n_groups = len(self._g_lens)
-        G = self.group_size
-        for g in range(n_groups):
-            j0 = g * G
-            j1 = j0 + self._g_lens[g]
-            xg = x[:, j0:j1]
-            wg = self._get_centered_scaled_group(g, device)
-            y.add_(xg @ wg.t())
+        w = self.w_cache.to(x.device, non_blocking=True)
+        y = torch.matmul(x, w.t())
         if self.bias is not None:
             y.add_(self.bias)
         return y
