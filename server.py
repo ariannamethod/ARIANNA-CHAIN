@@ -57,6 +57,8 @@ CACHE_MAX            = int(os.getenv("CACHE_MAX_ITEMS",      "256"))
 SCHEMA_VERSION       = os.getenv("SCHEMA_VERSION",           "1.3")
 RATE_CAPACITY        = int(os.getenv("RATE_CAPACITY",        "20"))
 RATE_REFILL_PER_SEC  = float(os.getenv("RATE_REFILL_PER_SEC","0.5"))
+RATE_STATE_TTL       = int(os.getenv("RATE_STATE_TTL",       "3600"))
+RATE_STATE_CLEANUP   = int(os.getenv("RATE_STATE_CLEANUP",   "1000"))
 HEARTBEAT_EVERY      = int(os.getenv("SSE_HEARTBEAT_EVERY",  "10"))
 TIME_PING_SECONDS    = float(os.getenv("SSE_TIME_HEARTBEAT_SEC", "12"))
 TIME_SENSITIVE_HINTS = ("now", "today", "сейчас", "сегодня", "latest", "свеж", "текущ")
@@ -86,21 +88,41 @@ def require_auth(fn: Callable):
 # Leaky-bucket rate-limiter
 # ────────────────────────────────────────────────────────────────────────────────
 class RateLimiter:
-    def __init__(self, capacity: int, refill_per_sec: float):
+    def __init__(self, capacity: int, refill_per_sec: float, state_ttl: int, cleanup_threshold: int):
         self.capacity, self.refill = capacity, refill_per_sec
         self.state: Dict[str, Tuple[float, float]] = {}
         self.lock = threading.Lock()
+        self.ttl = state_ttl
+        self._cleanup_threshold = cleanup_threshold
+        self._cleanup_running = False
+
+    def _cleanup(self):
+        now = time.time()
+        with self.lock:
+            stale = [k for k, (_, last) in self.state.items() if now - last > self.ttl]
+            for k in stale:
+                self.state.pop(k, None)
+            self._cleanup_running = False
 
     def allow(self, key: str) -> bool:
         now = time.time()
+        start_cleanup = False
         with self.lock:
             tokens, last = self.state.get(key, (self.capacity, now))
+            if now - last > self.ttl:
+                self.state.pop(key, None)
+                tokens, last = self.capacity, now
             tokens = min(self.capacity, tokens + (now - last) * self.refill)
             if tokens < 1.0:
                 self.state[key] = (tokens, now)
                 return False
             self.state[key] = (tokens - 1.0, now)
-            return True
+            if len(self.state) > self._cleanup_threshold and not self._cleanup_running:
+                self._cleanup_running = True
+                start_cleanup = True
+        if start_cleanup:
+            threading.Thread(target=self._cleanup, daemon=True).start()
+        return True
 
     def remaining(self, key: str) -> int:
         now = time.time()
@@ -118,7 +140,7 @@ def _client_key() -> str:
         return tok
     return request.remote_addr or "unknown"
 
-limiter = RateLimiter(RATE_CAPACITY, RATE_REFILL_PER_SEC)
+limiter = RateLimiter(RATE_CAPACITY, RATE_REFILL_PER_SEC, RATE_STATE_TTL, RATE_STATE_CLEANUP)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # LRU + TTL Cache (+ SimHash near-dup search)
