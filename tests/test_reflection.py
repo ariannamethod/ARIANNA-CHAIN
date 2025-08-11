@@ -8,6 +8,12 @@ class DummyMonitor:
     def __init__(self, *_, **__):
         pass
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        pass
+
     def search_prompts(self, *_args, **_kwargs):
         return []
 

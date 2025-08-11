@@ -480,6 +480,16 @@ class SelfMonitor:
             self.snapshot_codebase()
             SelfMonitor._snapshotted = True
 
+    def close(self) -> None:
+        if hasattr(self, "conn"):
+            self.conn.close()
+
+    def __enter__(self) -> "SelfMonitor":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
     def _init_db(self) -> None:
         cur = self.conn.cursor()
         cur.execute("CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, content BLOB, sha256 TEXT)")
@@ -811,28 +821,28 @@ def _redact(text: str) -> str:
     return red
 
 def _tool_memory_search(query: str, limit: int = 3) -> str:
-    sm = SelfMonitor()
-    pairs = sm.search_faiss(query, limit=limit)
-    notes = sm._search_notes(query, limit=limit)
-    if not pairs and not notes:
-        return "(no hits)"
-    out = []
-    for p, o in pairs:
-        p1 = _redact(p.strip().splitlines()[0][:160])
-        o1 = _redact(o.strip().splitlines()[0][:200])
-        out.append(f"- Q:{p1} | A:{o1}")
-    for n in notes:
-        out.append(f"- { _redact(n) }")
-    return "\n".join(out[:limit])
+    with SelfMonitor() as sm:
+        pairs = sm.search_faiss(query, limit=limit)
+        notes = sm._search_notes(query, limit=limit)
+        if not pairs and not notes:
+            return "(no hits)"
+        out = []
+        for p, o in pairs:
+            p1 = _redact(p.strip().splitlines()[0][:160])
+            o1 = _redact(o.strip().splitlines()[0][:200])
+            out.append(f"- Q:{p1} | A:{o1}")
+        for n in notes:
+            out.append(f"- { _redact(n) }")
+        return "\n".join(out[:limit])
 
 def _tool_memory_note(text: str) -> str:
-    sm = SelfMonitor()
-    sm.note(_redact(text)[:1000])
+    with SelfMonitor() as sm:
+        sm.note(_redact(text)[:1000])
     return "ok"
 
 def _tool_memory_link(prompt_sha: str, note_sha: str, relation: str) -> str:
-    sm = SelfMonitor()
-    sm.link_prompt(prompt_sha, note_sha, relation)
+    with SelfMonitor() as sm:
+        sm.link_prompt(prompt_sha, note_sha, relation)
     return "ok"
 
 def _tool_math_eval(expr: str) -> str:
@@ -1015,8 +1025,9 @@ def verify_step(trace_id: str, user_prompt: str, observation: str) -> str:
     obj = call_liquid(prompt, trace_id=trace_id, temperature=0.0)
     return str(obj.get("answer", ""))
 
-def reason_loop(
-    prompt: Optional[str] = None,
+def _reason_loop_body(
+    sm: SelfMonitor,
+    user_prompt: str,
     *,
     max_steps: int = 6,
     use_liquid: bool = True,
@@ -1025,18 +1036,7 @@ def reason_loop(
     checkpoint_every: int = 2,
     critical_every: int = 3,
     beams: int = 1,
-    retrieve: bool = False,
 ) -> str:
-    user_prompt = (prompt or CORE_PROMPT).strip()
-    if retrieve:
-        try:
-            store = VectorStore()
-            docs = store.search(user_prompt)
-            if docs:
-                user_prompt = "\n".join(docs) + "\n\n" + user_prompt
-        except Exception:
-            pass
-    sm = SelfMonitor()
     trace_id = uuid.uuid4().hex
     steps: List[Dict[str, Any]] = []
     stagnation = 0
@@ -1302,6 +1302,40 @@ def reason_loop(
         )
     return text
 
+def reason_loop(
+    prompt: Optional[str] = None,
+    *,
+    max_steps: int = 6,
+    use_liquid: bool = True,
+    progress_patience: int = 2,
+    base_temperature: float = 0.3,
+    checkpoint_every: int = 2,
+    critical_every: int = 3,
+    beams: int = 1,
+    retrieve: bool = False,
+) -> str:
+    user_prompt = (prompt or CORE_PROMPT).strip()
+    if retrieve:
+        try:
+            store = VectorStore()
+            docs = store.search(user_prompt)
+            if docs:
+                user_prompt = "\n".join(docs) + "\n\n" + user_prompt
+        except Exception:
+            pass
+    with SelfMonitor() as sm:
+        return _reason_loop_body(
+            sm,
+            user_prompt,
+            max_steps=max_steps,
+            use_liquid=use_liquid,
+            progress_patience=progress_patience,
+            base_temperature=base_temperature,
+            checkpoint_every=checkpoint_every,
+            critical_every=critical_every,
+            beams=beams,
+        )
+
 def tree_reason_loop(
     prompt: Optional[str] = None,
     *,
@@ -1319,28 +1353,28 @@ def tree_reason_loop(
     return best_answer
 
 def multi_reason(prompt: Optional[str] = None, paths: int = 5, **reason_kwargs) -> str:
-    sm = SelfMonitor()
-    temps = [0.2 + 0.6 * i / max(1, paths - 1) for i in range(max(1, paths))]
-    results: List[Dict[str, Any]] = []
-    for t in temps:
-        ans = reason_loop(prompt, base_temperature=t, **reason_kwargs)
-        conf = 1.0 - estimate_complexity_and_entropy(ans)[1]
-        entry = {"temperature": t, "answer": ans, "confidence": conf}
-        sm.log("<path>", json.dumps(entry, ensure_ascii=False))
-        results.append(entry)
+    with SelfMonitor() as sm:
+        temps = [0.2 + 0.6 * i / max(1, paths - 1) for i in range(max(1, paths))]
+        results: List[Dict[str, Any]] = []
+        for t in temps:
+            ans = reason_loop(prompt, base_temperature=t, **reason_kwargs)
+            conf = 1.0 - estimate_complexity_and_entropy(ans)[1]
+            entry = {"temperature": t, "answer": ans, "confidence": conf}
+            sm.log("<path>", json.dumps(entry, ensure_ascii=False))
+            results.append(entry)
 
-    counts = Counter(r["answer"] for r in results)
-    unique_answers = list(counts.keys())
+        counts = Counter(r["answer"] for r in results)
+        unique_answers = list(counts.keys())
 
-    def score(ans: str) -> float:
-        freq = counts[ans]
-        avg_conf = sum(r["confidence"] for r in results if r["answer"] == ans) / freq
-        diversities = [1 - _similarity(ans, other) for other in unique_answers if other != ans]
-        diversity = sum(diversities) / len(diversities) if diversities else 1.0
-        return freq + avg_conf + diversity
+        def score(ans: str) -> float:
+            freq = counts[ans]
+            avg_conf = sum(r["confidence"] for r in results if r["answer"] == ans) / freq
+            diversities = [1 - _similarity(ans, other) for other in unique_answers if other != ans]
+            diversity = sum(diversities) / len(diversities) if diversities else 1.0
+            return freq + avg_conf + diversity
 
-    best = max(unique_answers, key=score)
-    return best
+        best = max(unique_answers, key=score)
+        return best
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Mini GPT (toy CPU fallback) — W2A8 for Linear when apply_quant=True
@@ -1523,87 +1557,87 @@ def generate_text(
                 prompt = "\n".join(docs) + "\n\n" + prompt
         except Exception:
             pass
-    sm = SelfMonitor()
-    if use_memory:
-        examples = sm.search_embedding(prompt, limit=memory_limit) or sm.search(prompt, limit=memory_limit)
-        if examples:
-            combined = "\n".join(f"PrevPrompt: {p}\nPrevOutput: {o}" for p, o in examples)
-            prompt = f"{combined}\n\nCurrent:\n{prompt}"
-    if use_liquid:
-        try:
-            plan_obj = call_liquid(f"Plan the steps to answer: {prompt}", temperature=0.3)
-            plan = str(plan_obj.get("answer", ""))
-            obj = call_liquid(prompt, temperature=0.3)
-            think = str(obj.get("think", ""))
-            answer = str(obj.get("answer", ""))
+    with SelfMonitor() as sm:
+        if use_memory:
+            examples = sm.search_embedding(prompt, limit=memory_limit) or sm.search(prompt, limit=memory_limit)
+            if examples:
+                combined = "\n".join(f"PrevPrompt: {p}\nPrevOutput: {o}" for p, o in examples)
+                prompt = f"{combined}\n\nCurrent:\n{prompt}"
+        if use_liquid:
             try:
-                verify_obj = call_liquid(
-                    f"Question: {prompt}\nAnswer: {answer}\nverify the previous answer",
-                    temperature=0.0,
-                )
-                verified = str(verify_obj.get("answer", ""))
-                if verified:
-                    answer = verified
-            except Exception:
-                pass
-            text = f"<plan>{plan}</plan>\n<think>{think}</think>\n<answer>{answer}</answer>"
-            sm.log(prompt, text)
-            tokens, entropy, perplexity = estimate_complexity_and_entropy(text)
-            conf = float(obj.get("confidence", 1.0 - entropy))
-            rec = thought_logger.log_turn(text, tokens, entropy, perplexity, conf)
-            if self_reflect:
-                crit = reflect(prompt, text, use_liquid=True)
-                if "good" not in crit.lower():
-                    repair = call_liquid(
-                        f"Revise using this critique. Return JSON. Draft: {text}\nCritique: {crit}",
+                plan_obj = call_liquid(f"Plan the steps to answer: {prompt}", temperature=0.3)
+                plan = str(plan_obj.get("answer", ""))
+                obj = call_liquid(prompt, temperature=0.3)
+                think = str(obj.get("think", ""))
+                answer = str(obj.get("answer", ""))
+                try:
+                    verify_obj = call_liquid(
+                        f"Question: {prompt}\nAnswer: {answer}\nverify the previous answer",
                         temperature=0.0,
                     )
-                    text = str(repair.get("answer", text))
-                    sm.log("revise", text)
-            if log_reasoning:
-                return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
-            return text
-        except Exception:
-            model = AriannaC(AriannaCConfig())
-            idx = tokenizer.encode(prompt)
-            out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
-            tok = out[0] if out.dim() > 1 else out
-            text = tokenizer.decode(tok)
-            if self_reflect:
-                crit = reflect(prompt, text, use_liquid=False)
-                if "good" not in crit.lower():
-                    idx = tokenizer.encode(f"Revise using this critique. Draft: {text}\nCritique: {crit}")
-                    out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
-                    tok = out[0] if out.dim() > 1 else out
-                    text = tokenizer.decode(tok)
-                    sm.log("revise", text)
-            sm.log(prompt, text)
-            tokens, entropy, perplexity = estimate_complexity_and_entropy(text, model)
-            conf = 1.0 - entropy
-            rec = thought_logger.log_turn(text, tokens, entropy, perplexity, conf)
-            if log_reasoning:
-                return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
-            return text
-    model = AriannaC(AriannaCConfig())
-    idx = tokenizer.encode(prompt)
-    out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
-    tok = out[0] if out.dim() > 1 else out
-    text = tokenizer.decode(tok)
-    if self_reflect:
-        crit = reflect(prompt, text, use_liquid=False)
-        if "good" not in crit.lower():
-            idx = tokenizer.encode(f"Revise using this critique. Draft: {text}\nCritique: {crit}")
-            out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
-            tok = out[0] if out.dim() > 1 else out
-            text = tokenizer.decode(tok)
-            sm.log("revise", text)
-    sm.log(prompt, text)
-    tokens, entropy, perplexity = estimate_complexity_and_entropy(text, model)
-    conf = 1.0 - entropy
-    rec = thought_logger.log_turn(text, tokens, entropy, perplexity, conf)
-    if log_reasoning:
-        return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
-    return text
+                    verified = str(verify_obj.get("answer", ""))
+                    if verified:
+                        answer = verified
+                except Exception:
+                    pass
+                text = f"<plan>{plan}</plan>\n<think>{think}</think>\n<answer>{answer}</answer>"
+                sm.log(prompt, text)
+                tokens, entropy, perplexity = estimate_complexity_and_entropy(text)
+                conf = float(obj.get("confidence", 1.0 - entropy))
+                rec = thought_logger.log_turn(text, tokens, entropy, perplexity, conf)
+                if self_reflect:
+                    crit = reflect(prompt, text, use_liquid=True)
+                    if "good" not in crit.lower():
+                        repair = call_liquid(
+                            f"Revise using this critique. Return JSON. Draft: {text}\nCritique: {crit}",
+                            temperature=0.0,
+                        )
+                        text = str(repair.get("answer", text))
+                        sm.log("revise", text)
+                if log_reasoning:
+                    return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
+                return text
+            except Exception:
+                model = AriannaC(AriannaCConfig())
+                idx = tokenizer.encode(prompt)
+                out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
+                tok = out[0] if out.dim() > 1 else out
+                text = tokenizer.decode(tok)
+                if self_reflect:
+                    crit = reflect(prompt, text, use_liquid=False)
+                    if "good" not in crit.lower():
+                        idx = tokenizer.encode(f"Revise using this critique. Draft: {text}\nCritique: {crit}")
+                        out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
+                        tok = out[0] if out.dim() > 1 else out
+                        text = tokenizer.decode(tok)
+                        sm.log("revise", text)
+                sm.log(prompt, text)
+                tokens, entropy, perplexity = estimate_complexity_and_entropy(text, model)
+                conf = 1.0 - entropy
+                rec = thought_logger.log_turn(text, tokens, entropy, perplexity, conf)
+                if log_reasoning:
+                    return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
+                return text
+        model = AriannaC(AriannaCConfig())
+        idx = tokenizer.encode(prompt)
+        out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
+        tok = out[0] if out.dim() > 1 else out
+        text = tokenizer.decode(tok)
+        if self_reflect:
+            crit = reflect(prompt, text, use_liquid=False)
+            if "good" not in crit.lower():
+                idx = tokenizer.encode(f"Revise using this critique. Draft: {text}\nCritique: {crit}")
+                out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
+                tok = out[0] if out.dim() > 1 else out
+                text = tokenizer.decode(tok)
+                sm.log("revise", text)
+        sm.log(prompt, text)
+        tokens, entropy, perplexity = estimate_complexity_and_entropy(text, model)
+        conf = 1.0 - entropy
+        rec = thought_logger.log_turn(text, tokens, entropy, perplexity, conf)
+        if log_reasoning:
+            return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
+        return text
 
 def generate_with_think(
     prompt: Optional[str] = None,
