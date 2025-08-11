@@ -1,5 +1,6 @@
 import os
 import hashlib
+import threading
 import numpy as np
 
 from arianna_chain import TOOLS
@@ -100,5 +101,35 @@ def test_link_and_graph_search(tmp_path):
             TOOLS["memory.link"](prompt_sha=p2_sha, note_sha=n2_sha, relation="mentions")
             edges2 = monitor.graph_search(p2_sha, depth=1)
             assert (p2_sha, n2_sha, "mentions") in edges2
+    finally:
+        os.chdir(cwd)
+
+
+def test_thread_safety(tmp_path):
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        with SelfMonitor(db_path=str(tmp_path / "mem.sqlite"), check_same_thread=False) as monitor:
+            errors: list[Exception] = []
+
+            def worker(i: int) -> None:
+                try:
+                    monitor.log(f"p{i}", f"o{i}")
+                    monitor.note(f"n{i}")
+                except Exception as e:  # pragma: no cover
+                    errors.append(e)
+
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            assert not errors
+            cur = monitor.conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM logs")
+            assert cur.fetchone()[0] == 10
+            cur.execute("SELECT COUNT(*) FROM notes")
+            assert cur.fetchone()[0] == 10
     finally:
         os.chdir(cwd)
