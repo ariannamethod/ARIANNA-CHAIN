@@ -22,8 +22,15 @@ from logging.handlers import RotatingFileHandler
 from functools import wraps
 from collections import OrderedDict
 
-from flask import Flask, request, jsonify, Response, make_response
+from flask import Flask, request, jsonify, Response, make_response, g
 from openai import OpenAI
+from prometheus_client import (
+    Counter,
+    Gauge,
+    Histogram,
+    CONTENT_TYPE_LATEST,
+    generate_latest,
+)
 
 app = Flask(__name__)
 
@@ -38,6 +45,50 @@ handler = RotatingFileHandler(
 handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 app.logger.setLevel(logging.INFO)
 app.logger.addHandler(handler)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Metrics
+# ────────────────────────────────────────────────────────────────────────────────
+REQUEST_LATENCY = Histogram(
+    "arianna_request_latency_seconds", "Request latency", ["method", "endpoint"]
+)
+REQUEST_ERRORS = Counter(
+    "arianna_request_errors_total", "Total request errors", ["method", "endpoint"]
+)
+IN_PROGRESS = Gauge(
+    "arianna_requests_in_progress", "Active requests", ["method", "endpoint"]
+)
+
+
+@app.before_request
+def _metrics_before_request():
+    g.start_time = time.time()
+    IN_PROGRESS.labels(request.method, request.path).inc()
+
+
+@app.after_request
+def _metrics_after_request(response: Response):
+    if hasattr(g, "start_time"):
+        latency = time.time() - g.start_time
+        REQUEST_LATENCY.labels(request.method, request.path).observe(latency)
+        IN_PROGRESS.labels(request.method, request.path).dec()
+        if response.status_code >= 400:
+            REQUEST_ERRORS.labels(request.method, request.path).inc()
+    return response
+
+
+@app.teardown_request
+def _metrics_teardown_request(exc: Optional[BaseException]):
+    if exc is not None and hasattr(g, "start_time"):
+        latency = time.time() - g.start_time
+        REQUEST_LATENCY.labels(request.method, request.path).observe(latency)
+        REQUEST_ERRORS.labels(request.method, request.path).inc()
+        IN_PROGRESS.labels(request.method, request.path).dec()
+
+
+@app.get("/metrics")
+def metrics() -> Response:
+    return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
 
 if not os.getenv("OPENAI_API_KEY"):
     app.logger.critical("OPENAI_API_KEY не задан — выход")

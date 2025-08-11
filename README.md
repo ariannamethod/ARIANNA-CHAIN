@@ -144,6 +144,16 @@ Endpoints
 
 Auth (optional): Authorization: Bearer <ARIANNA_SERVER_TOKEN>
 
+Metrics
+        •       GET /metrics — Prometheus metrics in plain text
+        •       Captures latency, error count, and active request gauge
+
+Metrics are enabled by default. Scrape `/metrics` with Prometheus or simply:
+
+```bash
+curl http://localhost:8000/metrics
+```
+
 ⸻
 
 Notes on Modularity
