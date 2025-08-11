@@ -10,86 +10,126 @@ from .config import settings
 logger = logging.getLogger(__name__)
 
 
-# ---- simple HTTP client ------------------------------------------------------
-
-REQUIRED_FIELDS: Dict[str, Tuple[type, ...]] = {
-    "mode": (str,),
-    "think": (str,),
-    "answer": (str,),
-    "stop": (bool,),
-    "step": (int,),
-    "confidence": (int, float),
-    "halt_reason": (str,),
-}
+# ---- robust HTTP client ------------------------------------------------------
 
 
-class HTTPClient:
-    """Minimal HTTP client with basic validation."""
+class RobustHTTPClient:
+    """HTTP client with headers, retries and SSE support."""
 
-    def __init__(self, timeout: float = 60.0):
+    def __init__(
+        self,
+        *,
+        timeout: float = 60.0,
+        headers: Optional[Dict[str, str]] = None,
+        max_retries: int = 3,
+        backoff: float = 0.35,
+    ) -> None:
         self._local = threading.local()
         self.timeout = timeout
+        self.base_headers = headers or {}
+        self.max_retries = max_retries
+        self.backoff = backoff
 
     def _sess(self) -> requests.Session:
         s = getattr(self._local, "sess", None)
         if s is None:
             s = requests.Session()
             s.headers.update({"Content-Type": "application/json"})
+            s.headers.update(self.base_headers)
             self._local.sess = s
         return s
 
-    def post_json(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def post_json(
+        self,
+        url: str,
+        payload: Dict[str, Any],
+        *,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
         if not isinstance(url, str):
-            raise TypeError("url must be str, got %s" % type(url).__name__)
+            raise TypeError("url must be str")
         if not isinstance(payload, dict):
             raise TypeError("payload must be a dict")
-        r = self._sess().post(url, json=payload, timeout=self.timeout)
-        r.raise_for_status()
-        try:
-            data = r.json()
-        except ValueError as e:  # pragma: no cover
-            raise ValueError("Response is not valid JSON") from e
-        if not isinstance(data, dict):
-            raise ValueError("Response JSON must be object")
-        missing = [k for k in REQUIRED_FIELDS if k not in data]
-        if missing:
-            raise ValueError(f"Missing fields in response: {', '.join(missing)}")
-        wrong = [k for k, t in REQUIRED_FIELDS.items() if not isinstance(data.get(k), t)]
-        if wrong:
-            raise ValueError(f"Invalid field types in response: {', '.join(wrong)}")
-        return data
+        sess = self._sess()
+        last_exc: Exception | None = None
+        for i in range(self.max_retries):
+            try:
+                r = sess.post(url, json=payload, timeout=self.timeout, headers=headers)
+                if r.status_code == 429:
+                    retry_after = r.headers.get("Retry-After")
+                    try:
+                        sleep_s = float(retry_after) if retry_after else self.backoff * (2**i)
+                    except Exception:
+                        sleep_s = self.backoff * (2**i)
+                    time.sleep(sleep_s)
+                    continue
+                r.raise_for_status()
+                try:
+                    data = r.json()
+                except ValueError as e:  # pragma: no cover
+                    raise ValueError("Response is not valid JSON") from e
+                if not isinstance(data, dict):
+                    raise ValueError("Response JSON must be object")
+                return data
+            except requests.RequestException as e:  # pragma: no cover
+                last_exc = e
+                time.sleep(self.backoff * (2**i) + 0.2)
+        raise last_exc  # type: ignore[misc]
 
     def stream_sse(
-        self, url: str, payload: Dict[str, Any]
+        self,
+        url: str,
+        payload: Dict[str, Any],
+        *,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Generator[Tuple[str, Dict[str, Any] | None], None, None]:
         if not isinstance(url, str):
             raise TypeError("url must be str")
         if not isinstance(payload, dict):
             raise TypeError("payload must be a dict")
-        r = self._sess().post(url, json=payload, timeout=self.timeout, stream=True)
-        r.raise_for_status()
-        current_event = "message"
-        for line in r.iter_lines(decode_unicode=True):
-            if not line:
-                continue
-            if line.startswith("event:"):
-                event_name = line.split("event:", 1)[1].strip()
-                if event_name:
-                    current_event = event_name
-                else:
-                    logger.warning("Malformed event line: %s", line)
-                continue
-            if line.startswith("data:"):
-                data_raw = line.split("data:", 1)[1].strip()
-                try:
-                    data = json.loads(data_raw)
-                except Exception:
-                    logger.warning("Malformed JSON line: %s", line)
-                    yield (current_event, None)
+        sess = self._sess()
+        last_exc: Exception | None = None
+        for i in range(self.max_retries):
+            try:
+                r = sess.post(
+                    url, json=payload, timeout=self.timeout, stream=True, headers=headers
+                )
+                if r.status_code == 429:
+                    retry_after = r.headers.get("Retry-After")
+                    try:
+                        sleep_s = float(retry_after) if retry_after else self.backoff * (2**i)
+                    except Exception:
+                        sleep_s = self.backoff * (2**i)
+                    time.sleep(sleep_s)
                     continue
-                yield (current_event, data)
-            else:
-                logger.warning("Unrecognized line: %s", line)
+                r.raise_for_status()
+                current_event = "message"
+                for line in r.iter_lines(decode_unicode=True):
+                    if not line:
+                        continue
+                    if line.startswith("event:"):
+                        event_name = line.split("event:", 1)[1].strip()
+                        if event_name:
+                            current_event = event_name
+                        else:
+                            logger.warning("Malformed event line: %s", line)
+                        continue
+                    if line.startswith("data:"):
+                        data_raw = line.split("data:", 1)[1].strip()
+                        try:
+                            data = json.loads(data_raw)
+                        except Exception:
+                            logger.warning("Malformed JSON line: %s", line)
+                            yield (current_event, None)
+                            continue
+                        yield (current_event, data)
+                    else:
+                        logger.warning("Unrecognized line: %s", line)
+                return
+            except requests.RequestException as e:  # pragma: no cover
+                last_exc = e
+                time.sleep(self.backoff * (2**i) + 0.2)
+        raise last_exc  # type: ignore[misc]
 
 
 # ---- Liquid server wrappers ---------------------------------------------------
@@ -106,52 +146,13 @@ def _token() -> Optional[str]:
     return settings.arianna_server_token or None
 
 
-class _HTTP:
-    def __init__(self, timeout: float = 60.0):
-        self._local = threading.local()
-        self.timeout = timeout
-
-    def _sess(self) -> requests.Session:
-        s = getattr(self._local, "sess", None)
-        if s is None:
-            s = requests.Session()
-            s.headers.update({"Content-Type": "application/json"})
-            if _token():
-                s.headers["Authorization"] = f"Bearer {_token()}"
-            self._local.sess = s
-        return s
-
-    def post_json(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        base = 0.35
-        last_exc = None
-        for i in range(3):
-            try:
-                r = self._sess().post(url, json=payload, timeout=self.timeout)
-                if r.status_code == 429:
-                    retry_after = r.headers.get("Retry-After")
-                    try:
-                        sleep_s = float(retry_after) if retry_after else (base * (2 ** i))
-                    except Exception:
-                        sleep_s = base * (2 ** i)
-                    time.sleep(sleep_s)
-                    continue
-                r.raise_for_status()
-                return r.json()
-            except Exception as e:  # pragma: no cover
-                last_exc = e
-                time.sleep(base * (2 ** i) + 0.2)
-        raise last_exc  # type: ignore[misc]
-
-    def stream_sse(self, url: str, payload: Dict[str, Any]):
-        s = self._sess()
-        if _token():
-            s.headers["Authorization"] = f"Bearer {_token()}"
-        r = s.post(url, json=payload, timeout=self.timeout, stream=True)
-        r.raise_for_status()
-        return r.iter_lines(decode_unicode=True)
+def _headers() -> Dict[str, str]:
+    if _token():
+        return {"Authorization": f"Bearer {_token()}"}
+    return {}
 
 
-_http = _HTTP(timeout=90.0)
+_http = RobustHTTPClient(timeout=90.0)
 
 
 def call_liquid(
@@ -171,7 +172,7 @@ def call_liquid(
         payload["trace_id"] = trace_id
     url = _srv()
     _http.timeout = timeout
-    data = _http.post_json(url, payload)
+    data = _http.post_json(url, payload, headers=_headers())
     resp = data.get("response", data)
     if not isinstance(resp, dict):
         return {
@@ -200,20 +201,11 @@ def call_liquid_stream(
         payload["top_p"] = float(top_p)
     url = _srv_sse()
     _http.timeout = timeout
-    current_event = "message"
-    for line in _http.stream_sse(url, payload):
-        if not line:
-            continue
-        if line.startswith("event:"):
-            current_event = line.split("event:", 1)[1].strip()
-            continue
-        if line.startswith("data:"):
-            data_raw = line.split("data:", 1)[1].strip()
-            try:
-                data = json.loads(data_raw)
-            except Exception:
-                data = {"raw": data_raw}
-            yield (current_event, data)
+    for event, data in _http.stream_sse(url, payload, headers=_headers()):
+        if data is None:
+            yield (event, None)
+        else:
+            yield (event, data)
 
 
-__all__ = ["HTTPClient", "call_liquid", "call_liquid_stream"]
+__all__ = ["RobustHTTPClient", "call_liquid", "call_liquid_stream"]

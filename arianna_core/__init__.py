@@ -20,7 +20,7 @@ from .reasoning import (
     thought_logger,
     validate_reasoning_tags,
 )
-from .http import HTTPClient, call_liquid, call_liquid_stream
+from .http import RobustHTTPClient, call_liquid, call_liquid_stream
 
 PERSONA_PATH = Path(__file__).resolve().parent.parent / "prompts" / "core.txt"
 PERSONA = PERSONA_PATH.read_text(encoding="utf-8").strip()
@@ -43,7 +43,7 @@ __all__ = [
     "tokenizer",
     "ByteTokenizer",
     "TokenTensor",
-    "HTTPClient",
+    "RobustHTTPClient",
     "call_liquid",
     "call_liquid_stream",
     "CORE_PROMPT",
