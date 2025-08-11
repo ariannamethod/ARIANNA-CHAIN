@@ -15,6 +15,7 @@ import logging
 import threading
 import hashlib
 import re
+import base64
 from typing import Dict, Any, Callable, Generator, Tuple, Optional
 from logging.handlers import RotatingFileHandler
 from functools import wraps
@@ -64,6 +65,9 @@ TIME_PING_SECONDS    = float(os.getenv("SSE_TIME_HEARTBEAT_SEC", "12"))
 TIME_SENSITIVE_HINTS = ("now", "today", "сейчас", "сегодня", "latest", "свеж", "текущ")
 CODE_BLOCK_LIMIT     = int(os.getenv("CODE_BLOCK_LIMIT", "65536"))
 SIMHASH_HAMMING_THR  = int(os.getenv("SIMHASH_HAMMING_THR", "3"))
+BASE64_MIN_LENGTH    = 200
+BASE64_MAX_ANALYZE   = 4096
+BASE64_ALPHABET      = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Авторизация
@@ -323,7 +327,33 @@ def _sanitize_prompt(prompt: str, limit: int = PROMPT_LIMIT_CHARS) -> str:
     prompt = prompt.strip()
     if len(prompt) > limit:
         prompt = prompt[:limit] + f"\n\n[truncated at {limit} chars]"
-    prompt = re.sub(r"[A-Za-z0-9+/]{200,}={0,2}", "[BASE64_REDACTED]", prompt)
+    res = []
+    i = 0
+    n = len(prompt)
+    while i < n:
+        ch = prompt[i]
+        if ch in BASE64_ALPHABET:
+            j = i
+            while j < n and prompt[j] in BASE64_ALPHABET:
+                j += 1
+            block = prompt[i:j]
+            if len(block) >= BASE64_MIN_LENGTH and len(block) % 4 == 0:
+                sample = block[:BASE64_MAX_ANALYZE]
+                sample = sample[: len(sample) - (len(sample) % 4)]
+                try:
+                    if sample:
+                        base64.b64decode(sample, validate=True)
+                        res.append("[BASE64_REDACTED]")
+                        i = j
+                        continue
+                except Exception:
+                    pass
+            res.append(block)
+            i = j
+            continue
+        res.append(ch)
+        i += 1
+    prompt = "".join(res)
     prompt = _truncate_large_code_blocks(prompt)
     return prompt
 
