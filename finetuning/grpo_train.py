@@ -10,7 +10,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, Iterator, List, Tuple
 
 import torch
 
@@ -31,9 +31,8 @@ logger.addHandler(_file_handler)
 logger.addHandler(_stream_handler)
 
 
-def load_dataset(path: str, min_confidence: float = 0.0) -> List[Dict[str, str]]:
-    """Load a JSONL dataset and filter entries by confidence."""
-    items: List[Dict[str, str]] = []
+def iter_dataset(path: str, min_confidence: float = 0.0) -> Iterator[Dict[str, str]]:
+    """Yield dataset entries lazily from a JSONL file."""
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             if not line.strip():
@@ -45,8 +44,12 @@ def load_dataset(path: str, min_confidence: float = 0.0) -> List[Dict[str, str]]
             prompt = obj.get("prompt") or obj.get("question") or ""
             answer = obj.get("answer") or obj.get("solution") or ""
             plan = obj.get("plan", "")
-            items.append({"prompt": prompt, "answer": answer, "plan": plan, "confidence": conf})
-    return items
+            yield {"prompt": prompt, "answer": answer, "plan": plan, "confidence": conf}
+
+
+def load_dataset(path: str, min_confidence: float = 0.0) -> List[Dict[str, str]]:
+    """Eagerly load a JSONL dataset into memory."""
+    return list(iter_dataset(path, min_confidence))
 
 
 def accuracy_reward(pred: str, target: str) -> float:
@@ -98,13 +101,12 @@ def sample_with_grad(
 
 
 def train(args: argparse.Namespace) -> None:
-    data = load_dataset(args.dataset, args.min_confidence)
     model = load_model(args.model_path)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     step = 0
     for epoch in range(args.epochs):
-        for sample in data:
+        for sample in iter_dataset(args.dataset, args.min_confidence):
             prompt = sample.get("prompt") or sample.get("question") or ""
             target = sample.get("solution") or sample.get("answer") or ""
 

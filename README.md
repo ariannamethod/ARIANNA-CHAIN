@@ -94,6 +94,9 @@ pytest tests/test_reasoning.py::test_gsm8k_subset_accuracy -q
 
 Swap dataset files or generators to benchmark variants.
 
+The training script exposes `iter_dataset` for streaming large JSONL files
+without loading them entirely into memory.
+
 ⸻
 
 GRPO Fine-Tuning (Minimal)
@@ -106,6 +109,9 @@ python finetuning/grpo_train.py \
   --save-every 50
 
 Checkpoints + logs in logs/grpo/. Rewards track accuracy, reasoning tags, and output length.
+
+`finetuning/grpo_train.py` iterates over the dataset lazily, enabling
+fine-tuning with datasets that don't fit in memory.
 
 ⸻
 
