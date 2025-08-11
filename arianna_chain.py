@@ -1524,7 +1524,8 @@ def generate_text(
     max_new_tokens: int = 256,
     log_reasoning: bool = False,
     retrieve: bool = False,
-    ) -> str | tuple[str, dict[str, float | int]]:
+    monitor: SelfMonitor | None = None,
+) -> str | tuple[str, dict[str, float | int]]:
     prompt = (prompt or CORE_PROMPT).strip()
     if retrieve:
         try:
@@ -1616,8 +1617,10 @@ def generate_text(
         if log_reasoning:
             return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
         return text
-    with SelfMonitor() as sm:
-        return _run(sm)
+    if monitor is None:
+        with SelfMonitor() as sm:
+            return _run(sm)
+    return _run(monitor)
 
 def generate_with_think(
     prompt: Optional[str] = None,

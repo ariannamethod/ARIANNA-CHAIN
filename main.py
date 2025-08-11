@@ -5,7 +5,7 @@ import logging
 import os
 import re
 
-from arianna_chain import generate_text
+from arianna_chain import SelfMonitor, generate_text
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -27,7 +27,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """Send the user's message to Arianna-C and return the answer."""
     prompt = update.message.text or ""
     try:
-        result = await asyncio.to_thread(generate_text, prompt)
+        with SelfMonitor() as sm:
+            result = await asyncio.to_thread(generate_text, prompt, monitor=sm)
         text = result[0] if isinstance(result, tuple) else result
         match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
         reply = (match.group(1).strip() if match else text.strip()) or "(пустой ответ)"
