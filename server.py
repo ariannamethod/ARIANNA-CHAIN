@@ -607,13 +607,21 @@ def _log(level: int, msg: Dict[str, Any]):
 # ────────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
+    openai_ok = False
+    try:
+        _openai_client().models.list()
+        openai_ok = True
+    except Exception:
+        openai_ok = False
+
     return jsonify({
-        "ok": True,
+        "status": "ok",
         "model": MODEL_DEFAULT,
         "model_light": MODEL_LIGHT,
         "model_heavy": MODEL_HEAVY,
         "cache_items": len(cache),
-        "schema_version": SCHEMA_VERSION
+        "openai": openai_ok,
+        "schema_version": SCHEMA_VERSION,
     }), 200
 
 # ────────────────────────────────────────────────────────────────────────────────
