@@ -1,9 +1,10 @@
-torch
-tokenizers
-flask
-openai>=1.0.0
-gunicorn
-sentence-transformers
-faiss-cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
 
-python-telegram-bot
+torch==2.8.0+cpu
+tokenizers==0.21.4
+Flask==3.1.1
+openai==1.99.6
+gunicorn==23.0.0
+sentence-transformers==5.1.0
+faiss-cpu==1.11.0.post1
+python-telegram-bot==22.3
