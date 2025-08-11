@@ -58,23 +58,36 @@ from arianna_core import (
 class VectorStore:
     """Store documents as dense vectors and perform similarity search."""
 
-    def __init__(self, documents: List[str] | None = None, dim: int = 128) -> None:
-        self.dim = dim
+    def __init__(self, documents: List[str] | None = None, dim: int | None = None) -> None:
+        self.dim = dim or 0
         self.documents: List[str] = []
-        if faiss:
-            self.index = faiss.IndexFlatIP(dim)
+        self.embed_model = None
+        if faiss and self.dim:
+            self.index = faiss.IndexFlatIP(self.dim)
         else:  # pragma: no cover
             self.index = None
             self.vectors: List[np.ndarray] = []
         if documents:
             self.add(documents)
 
+    def _ensure_embed_model(self):
+        if self.embed_model is None:
+            try:
+                from sentence_transformers import SentenceTransformer  # type: ignore
+
+                self.embed_model = SentenceTransformer(settings.arianna_embed_model)
+                self.dim = self.embed_model.get_sentence_embedding_dimension()
+                if faiss and self.index is None:
+                    self.index = faiss.IndexFlatIP(self.dim)
+            except Exception:  # pragma: no cover
+                self.embed_model = None
+        return self.embed_model
+
     def _embed(self, text: str) -> np.ndarray:
-        vec = np.frombuffer(text.encode("utf-8"), dtype="uint8").astype("float32")
-        if vec.size < self.dim:
-            vec = np.pad(vec, (0, self.dim - vec.size))
-        else:
-            vec = vec[: self.dim]
+        model = self._ensure_embed_model()
+        if model is None:
+            raise RuntimeError("embedding model not available")
+        vec = model.encode([text])[0].astype("float32")
         norm = np.linalg.norm(vec) or 1.0
         return vec / norm
 
