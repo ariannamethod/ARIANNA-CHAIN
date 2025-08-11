@@ -1,9 +1,11 @@
-"""Telegram bot interface for Arianna Chain using OpenAI Responses API."""
+"""Telegram bot interface for Arianna Chain via internal server."""
+
 import asyncio
 import logging
 import os
+import re
 
-from openai import OpenAI
+from arianna_chain import generate_text
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -15,9 +17,6 @@ from telegram.ext import (
 
 logging.basicConfig(level=logging.INFO)
 
-client = OpenAI()
-MODEL = os.getenv("ARIANNA_MODEL", "gpt-4.1")
-
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Greet the user."""
@@ -25,14 +24,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send the user's message to OpenAI and return the reply."""
+    """Send the user's message to Arianna-C and return the answer."""
     prompt = update.message.text or ""
     try:
-        resp = client.responses.create(model=MODEL, input=prompt)
-        text = getattr(resp, "output_text", "").strip() or "(пустой ответ)"
-        await update.message.reply_text(text)
+        result = await asyncio.to_thread(generate_text, prompt)
+        text = result[0] if isinstance(result, tuple) else result
+        match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
+        reply = (match.group(1).strip() if match else text.strip()) or "(пустой ответ)"
+        await update.message.reply_text(reply)
     except Exception as exc:  # pragma: no cover
-        logging.exception("OpenAI request failed")
+        logging.exception("Arianna chain request failed")
         await update.message.reply_text(f"Ошибка: {exc}")
 
 
