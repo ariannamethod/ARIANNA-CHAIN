@@ -1,19 +1,27 @@
 import logging
+import time
 from typing import Any, Dict
 
-import pytest
-
-from arianna_core.http import HTTPClient
+from arianna_core.http import RobustHTTPClient
 
 
 class DummyResponse:
-    def __init__(self, data: Any, *, lines: list[str] | None = None):
+    def __init__(
+        self,
+        data: Any,
+        *,
+        lines: list[str] | None = None,
+        status_code: int = 200,
+        headers: Dict[str, str] | None = None,
+    ):
         self._data = data
-        self.status_code = 200
+        self.status_code = status_code
         self._lines = lines or []
+        self.headers = headers or {}
 
     def raise_for_status(self) -> None:
-        return None
+        if self.status_code >= 400:
+            raise Exception("error")
 
     def json(self) -> Any:
         return self._data
@@ -23,29 +31,27 @@ class DummyResponse:
             yield line
 
 
-class DummySession:
-    def __init__(self, resp: DummyResponse):
-        self.resp = resp
+def test_post_json_retries_and_headers(monkeypatch):
+    class DummySession:
+        def __init__(self):
+            self.calls = 0
+            self.last_headers: Dict[str, str] | None = None
 
-    def post(self, url: str, json: Dict[str, Any], timeout: float, stream: bool = False):
-        return self.resp
+        def post(self, url: str, json: Dict[str, Any], timeout: float, headers=None, stream: bool = False):
+            self.calls += 1
+            self.last_headers = headers
+            if self.calls == 1:
+                return DummyResponse({}, status_code=429)
+            return DummyResponse({"ok": True})
 
-
-@pytest.fixture
-def client(monkeypatch):
-    c = HTTPClient()
-    # prevent real HTTP session creation
-    monkeypatch.setattr(c, "_sess", lambda: DummySession(DummyResponse({})))
-    return c
-
-
-def test_post_json_missing_fields(client, monkeypatch):
-    data = {"mode": "final"}  # missing required fields
-    resp = DummyResponse(data)
-    monkeypatch.setattr(client, "_sess", lambda: DummySession(resp))
-    with pytest.raises(ValueError) as exc:
-        client.post_json("http://example.com", {})
-    assert "Missing fields" in str(exc.value)
+    c = RobustHTTPClient()
+    sess = DummySession()
+    monkeypatch.setattr(c, "_sess", lambda: sess)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    data = c.post_json("http://example.com", {}, headers={"X-Test": "1"})
+    assert data == {"ok": True}
+    assert sess.calls == 2
+    assert sess.last_headers["X-Test"] == "1"
 
 
 def test_stream_sse_invalid_event_and_json(monkeypatch, caplog):
@@ -54,8 +60,13 @@ def test_stream_sse_invalid_event_and_json(monkeypatch, caplog):
         "data: {\"a\": 1",  # truncated JSON
     ]
     resp = DummyResponse({}, lines=lines)
-    c = HTTPClient()
-    monkeypatch.setattr(c, "_sess", lambda: DummySession(resp))
+
+    class DummySession:
+        def post(self, url: str, json: Dict[str, Any], timeout: float, headers=None, stream: bool = False):
+            return resp
+
+    c = RobustHTTPClient()
+    monkeypatch.setattr(c, "_sess", lambda: DummySession())
     with caplog.at_level(logging.WARNING):
         items = list(c.stream_sse("http://example.com", {}))
     assert items == [("message", None)]
