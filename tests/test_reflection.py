@@ -1,7 +1,8 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from arianna_chain import generate_text, tokenizer
+from arianna_chain import generate_text
+from arianna_core import tokenizer
 
 
 class DummyMonitor:

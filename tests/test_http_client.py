@@ -3,7 +3,7 @@ from typing import Any, Dict
 
 import pytest
 
-from arianna.http_client import HTTPClient
+from arianna_core.http import HTTPClient
 
 
 class DummyResponse:

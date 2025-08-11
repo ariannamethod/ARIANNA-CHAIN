@@ -5,7 +5,8 @@ import logging
 import os
 import re
 
-from arianna_chain import SelfMonitor, generate_text
+from arianna_chain import generate_text
+from arianna_core import SelfMonitor
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,

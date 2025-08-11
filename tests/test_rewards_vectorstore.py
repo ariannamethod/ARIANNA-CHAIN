@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from arianna_chain import format_reward, reasoning_steps_reward, VectorStore
+from arianna_chain import VectorStore
+from arianna_core import format_reward, reasoning_steps_reward
 
 
 def test_format_reward_valid_and_invalid() -> None:
