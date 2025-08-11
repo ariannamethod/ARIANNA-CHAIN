@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, cast
 
 import torch
 import torch.nn as nn
@@ -236,7 +236,8 @@ class CausalSelfAttention(nn.Module):
         q = self.query(x_flat).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = self.value(x_flat).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+        bias = cast(torch.Tensor, self.bias)
+        att = att.masked_fill(bias[:, :, :T, :T] == 0, float("-inf"))
         att = torch.softmax(att, dim=-1)
         att = self.attn_dropout(att)
         y = att @ v

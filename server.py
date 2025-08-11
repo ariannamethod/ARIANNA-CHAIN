@@ -220,7 +220,14 @@ def _hamdist64(a: int, b: int) -> int:
     return ((a ^ b).bit_count())
 
 _semantic_meta: Dict[str, int] = {}
-cache = LRUCacheTTL(CACHE_MAX, CACHE_TTL, evict_cb=lambda k: _semantic_meta.pop(k, None))
+
+
+def _semantic_evict(key: str) -> None:
+    """Remove semantic metadata on cache eviction."""
+    _semantic_meta.pop(key, None)
+
+
+cache = LRUCacheTTL(CACHE_MAX, CACHE_TTL, evict_cb=_semantic_evict)
 
 def _semantic_cache_get_fuzzy(target_key_prefix: str, prompt: str) -> Optional[Dict[str, Any]]:
     try:
@@ -380,8 +387,8 @@ def _coerce_and_validate(obj: Any) -> Dict[str, Any]:
     if isinstance(obj.get("trace_id"), str):
         out["trace_id"] = obj["trace_id"].strip()
     try:
-        c = float(obj.get("confidence", 0.7))
-        out["confidence"] = max(0.0, min(1.0, c))
+        confidence = float(obj.get("confidence", 0.7))
+        out["confidence"] = max(0.0, min(1.0, confidence))
     except Exception:
         out["confidence"] = 0.7
     hr = obj.get("halt_reason")
@@ -395,15 +402,15 @@ def _coerce_and_validate(obj: Any) -> Dict[str, Any]:
     if isinstance(obj.get("observation"), str):
         out["observation"] = obj["observation"]
     if isinstance(obj.get("controls"), dict):
-        c: Dict[str, float] = {}
+        controls: Dict[str, float] = {}
         for k in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
             if k in obj["controls"]:
                 try:
-                    c[k] = float(obj["controls"][k])
+                    controls[k] = float(obj["controls"][k])
                 except Exception:
                     pass
-        if c:
-            out["controls"] = c
+        if controls:
+            out["controls"] = controls
     if isinstance(obj.get("tokens_used"), dict):
         try:
             tu = obj["tokens_used"]
@@ -446,7 +453,7 @@ def _detect_red_flags(answer: str) -> list[str]:
 def _responses_create(prompt: str, *, model: Optional[str], temperature: float, top_p: float,
                       check_flags: bool = True) -> Tuple[Dict[str, Any], Dict[str, int], Optional[str]]:
     client = _openai_client()
-    resp = client.responses.create(
+    resp = client.responses.create(  # type: ignore[call-overload]
         model=model or MODEL_DEFAULT,
         input=prompt,
         temperature=temperature,
@@ -514,7 +521,7 @@ def _responses_stream(prompt: str, *, model: Optional[str], temperature: float, 
     buf = ""
     field_vals = {"plan": "", "reasoning": "", "repair": ""}
     try:
-        with client.responses.stream(
+        with client.responses.stream(  # type: ignore[call-overload]
             model=model or MODEL_DEFAULT,
             input=prompt,
             temperature=temperature,

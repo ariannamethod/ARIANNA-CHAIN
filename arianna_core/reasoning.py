@@ -11,7 +11,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, TYPE_CHECKING, cast
 
 import numpy as np
 import torch
@@ -21,6 +21,10 @@ try:  # pragma: no cover - optional dependency
     import faiss  # type: ignore
 except Exception:  # pragma: no cover
     faiss = None
+
+if TYPE_CHECKING:  # pragma: no cover - for type checkers only
+    from sentence_transformers import SentenceTransformer
+    import faiss as faiss_module
 
 from .config import settings
 from .tokenizer import tokenizer
@@ -180,8 +184,8 @@ class SelfMonitor:
         self.conn.execute("PRAGMA synchronous=NORMAL;")
         env_flag = settings.arianna_disable_embed
         self.use_embeddings = use_embeddings if use_embeddings is not None else not env_flag
-        self.embed_model = None
-        self.faiss_index = None
+        self.embed_model: Optional["SentenceTransformer"] = None
+        self.faiss_index: Optional["faiss_module.Index"] = None
         self.faiss_ids: list[str] = []
         self.faiss_dim = 0
         self.index_dir = Path("logs/faiss_index")
@@ -225,9 +229,10 @@ class SelfMonitor:
         self.index_dir.mkdir(parents=True, exist_ok=True)
         if self.index_file.exists() and self.ids_file.exists():
             try:
-                self.faiss_index = faiss.read_index(str(self.index_file))
+                index = faiss.read_index(str(self.index_file))
+                self.faiss_index = index
                 self.faiss_ids = json.loads(self.ids_file.read_text())
-                self.faiss_dim = self.faiss_index.d
+                self.faiss_dim = index.d
             except Exception:
                 self.faiss_index = None
                 self.faiss_ids = []
@@ -240,13 +245,14 @@ class SelfMonitor:
         if self.faiss_index is None:
             self.faiss_index = faiss.IndexFlatIP(dim)
             self.faiss_dim = dim
-        if dim != self.faiss_dim:
+        if dim != self.faiss_dim or self.faiss_index is None:
             return
+        index = self.faiss_index
         v = vec.astype("float32")
         n = np.linalg.norm(v) + 1e-9
-        self.faiss_index.add((v / n).reshape(1, -1))
+        index.add((v / n).reshape(1, -1))
         self.faiss_ids.append(sha)
-        faiss.write_index(self.faiss_index, str(self.index_file))
+        faiss.write_index(index, str(self.index_file))
         self.ids_file.write_text(json.dumps(self.faiss_ids))
 
     def snapshot_codebase(self, root: str | Path = ".") -> None:
@@ -299,7 +305,7 @@ class SelfMonitor:
                 self._add_to_index(sha, vec)
         self.conn.commit()
 
-    def _ensure_embed_model(self):
+    def _ensure_embed_model(self) -> Optional["SentenceTransformer"]:
         if not self.use_embeddings:
             return None
         if self.embed_model is None:
@@ -326,6 +332,7 @@ class SelfMonitor:
                 (prompt, output),
             )
             if self._ensure_embed_model():
+                assert self.embed_model is not None
                 vec = self.embed_model.encode([prompt])[0].astype("float32")
                 cur.execute(
                     "INSERT OR REPLACE INTO embeddings(sha256, embedding) VALUES (?,?)",
@@ -418,11 +425,13 @@ class SelfMonitor:
     def search_faiss(self, query: str, limit: int = 5, return_scores: bool = False):
         if not self._ensure_embed_model() or self.faiss_index is None:
             return []
+        assert self.embed_model is not None
+        index = self.faiss_index
         qv = self.embed_model.encode([query])[0].astype("float32")
-        if len(qv) != self.faiss_dim:
+        if len(qv) != self.faiss_dim or index is None:
             return []
         n = np.linalg.norm(qv) + 1e-9
-        D, indices = self.faiss_index.search((qv / n).reshape(1, -1), limit)
+        D, indices = index.search((qv / n).reshape(1, -1), limit)
         cur = self.conn.cursor()
         out = []
         for score, idx in zip(D[0], indices[0]):
