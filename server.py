@@ -743,7 +743,7 @@ def generate():
 # ────────────────────────────────────────────────────────────────────────────────
 # /generate_sse
 # ────────────────────────────────────────────────────────────────────────────────
-@app.post("/generate_sse")
+@app.route("/generate_sse", methods=["POST", "GET"])
 @require_auth
 def generate_sse():
     req_id = uuid.uuid4().hex
@@ -766,7 +766,10 @@ def generate_sse():
         }
         return Response(body, headers=headers)
     try:
-        payload = request.get_json(force=True) or {}
+        if request.method == "POST":
+            payload = request.get_json(force=True) or {}
+        else:
+            payload = request.args or {}
         prompt = _sanitize_prompt(str(payload.get("prompt", "")))
         if not prompt:
             return Response(

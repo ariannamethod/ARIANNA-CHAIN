@@ -1,3 +1,4 @@
+# flake8: noqa
 import os
 import json
 from typing import Generator
@@ -67,6 +68,44 @@ def test_generate_sse(monkeypatch):
     monkeypatch.setattr(server, "_responses_stream", fake_stream)
     client = server.app.test_client()
     resp = client.post("/generate_sse", json={"prompt": "hi"}, headers=VALID_HEADERS)
+
+    chunks = []
+    for chunk in resp.response:
+        chunks.append(chunk)
+        if len(chunks) >= 4:
+            break
+
+    assert chunks[0] == b": ready\n\n"
+    joined = b"".join(chunks[1:])
+    assert b"event: response.output_text.delta" in joined
+    assert b"event: response.completed" in joined
+
+
+def test_generate_sse_get(monkeypatch):
+    def fake_stream(prompt: str, *, model=None, temperature=0.3, top_p=0.95) -> Generator[str, None, None]:
+        yield "retry: 10000\n\n"
+        yield (
+            "event: response.output_text.delta\n"
+            f"data: {json.dumps({'delta': 'chunk1'})}\n\n"
+        )
+        completed = json.dumps(
+            {
+                'mode': 'final',
+                'think': '',
+                'answer': 'done',
+                'stop': True,
+                'step': 1,
+                'halt_reason': 'stop',
+            }
+        )
+        yield (
+            "event: response.completed\n"
+            f"data: {completed}\n\n"
+        )
+
+    monkeypatch.setattr(server, "_responses_stream", fake_stream)
+    client = server.app.test_client()
+    resp = client.get("/generate_sse", query_string={"prompt": "hi"}, headers=VALID_HEADERS)
 
     chunks = []
     for chunk in resp.response:
