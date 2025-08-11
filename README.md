@@ -30,7 +30,7 @@ the codebase.
    ```bash
    python -m venv .venv
    source .venv/bin/activate
-   pip install -r requirements.txt
+   pip install --extra-index-url https://download.pytorch.org/whl/cpu .
    ```
 
 3. **Configure environment variables**
@@ -232,9 +232,10 @@ Notes on Modularity
 ⸻
 
 Dependency Management
-        •       requirements.txt pins tested versions for reproducible CPU-only installs.
-        •       PyTorch is pulled from the CPU wheel index (`--extra-index-url https://download.pytorch.org/whl/cpu`).
-        •       To upgrade, install the new package version, update requirements.txt, then run `flake8 && pytest`.
+        •       Install via `pip install --extra-index-url https://download.pytorch.org/whl/cpu .`.
+        •       `requirements.txt` pins tested versions for reproducible CPU-only installs.
+        •       PyTorch is pulled from the CPU wheel index.
+        •       To upgrade, install the new package version, update `requirements.txt`, then run `flake8 && pytest`.
 
 ⸻
 
