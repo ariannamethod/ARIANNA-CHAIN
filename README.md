@@ -147,6 +147,13 @@ Notes on Modularity
 
 ⸻
 
+Dependency Management
+        •       requirements.txt pins tested versions for reproducible CPU-only installs.
+        •       PyTorch is pulled from the CPU wheel index (`--extra-index-url https://download.pytorch.org/whl/cpu`).
+        •       To upgrade, install the new package version, update requirements.txt, then run `flake8 && pytest`.
+
+⸻
+
 Acknowledgements
 	•	DeepSeek R1 concepts
 	•	nanoGPT by Andrej Karpathy
