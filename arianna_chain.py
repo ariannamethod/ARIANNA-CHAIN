@@ -480,6 +480,15 @@ class SelfMonitor:
             self.snapshot_codebase()
             SelfMonitor._snapshotted = True
 
+    def close(self) -> None:
+        self.conn.close()
+
+    def __enter__(self) -> "SelfMonitor":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
     def _init_db(self) -> None:
         cur = self.conn.cursor()
         cur.execute("CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, content BLOB, sha256 TEXT)")
@@ -811,28 +820,28 @@ def _redact(text: str) -> str:
     return red
 
 def _tool_memory_search(query: str, limit: int = 3) -> str:
-    sm = SelfMonitor()
-    pairs = sm.search_faiss(query, limit=limit)
-    notes = sm._search_notes(query, limit=limit)
-    if not pairs and not notes:
-        return "(no hits)"
-    out = []
-    for p, o in pairs:
-        p1 = _redact(p.strip().splitlines()[0][:160])
-        o1 = _redact(o.strip().splitlines()[0][:200])
-        out.append(f"- Q:{p1} | A:{o1}")
-    for n in notes:
-        out.append(f"- { _redact(n) }")
-    return "\n".join(out[:limit])
+    with SelfMonitor() as sm:
+        pairs = sm.search_faiss(query, limit=limit)
+        notes = sm._search_notes(query, limit=limit)
+        if not pairs and not notes:
+            return "(no hits)"
+        out = []
+        for p, o in pairs:
+            p1 = _redact(p.strip().splitlines()[0][:160])
+            o1 = _redact(o.strip().splitlines()[0][:200])
+            out.append(f"- Q:{p1} | A:{o1}")
+        for n in notes:
+            out.append(f"- { _redact(n) }")
+        return "\n".join(out[:limit])
 
 def _tool_memory_note(text: str) -> str:
-    sm = SelfMonitor()
-    sm.note(_redact(text)[:1000])
+    with SelfMonitor() as sm:
+        sm.note(_redact(text)[:1000])
     return "ok"
 
 def _tool_memory_link(prompt_sha: str, note_sha: str, relation: str) -> str:
-    sm = SelfMonitor()
-    sm.link_prompt(prompt_sha, note_sha, relation)
+    with SelfMonitor() as sm:
+        sm.link_prompt(prompt_sha, note_sha, relation)
     return "ok"
 
 def _tool_math_eval(expr: str) -> str:
@@ -1036,271 +1045,273 @@ def reason_loop(
                 user_prompt = "\n".join(docs) + "\n\n" + user_prompt
         except Exception:
             pass
-    sm = SelfMonitor()
-    trace_id = uuid.uuid4().hex
-    steps: List[Dict[str, Any]] = []
-    stagnation = 0
-    final_answer = ""
-    temperature = base_temperature
-
-    def render_context(expected_next: str = "") -> str:
-        lines = [
-            "=== SYSTEM INSTRUCTION ===",
-            CORE_PROMPT,
-            "=== TOOLS (name -> args schema) ===",
-            _tools_manifest(),
-            "=== TRACE (latest first) ===",
-        ]
-        for s in reversed(steps[-6:]):
-            lines.append(json.dumps(s, ensure_ascii=False))
-        lines.append("=== USER PROMPT ===")
-        lines.append(user_prompt)
-        if expected_next:
-            lines.append(f"=== MODE HINT ===\nExpected next step: {expected_next}")
-        ctx = "\n".join(lines)
-        ctx = re.sub(r"[A-Za-z0-9+/]{200,}={0,2}", "[BASE64_REDACTED]", ctx)
-        return ctx
-
-    def ensure_budget(ctx: str):
-        if steps and isinstance(steps[-1].get("tokens_used"), dict):
-            last_total = int(steps[-1]["tokens_used"].get("total", 0))
-            if last_total > LAST_USAGE_SUMMARIZE_THRESHOLD:
-                full = "\n".join(json.dumps(s, ensure_ascii=False) for s in steps)
-                summary = _summarize_trace(full, trace_id=trace_id)
-                steps.clear()
-                steps.append({"trace_id": trace_id, "step": 0, "mode": "reflect", "think": "summary", "answer": summary, "stop": False, "meta": {"summarized": True}})
+    def _run(sm: SelfMonitor) -> str:
+        trace_id = uuid.uuid4().hex
+        steps: List[Dict[str, Any]] = []
+        stagnation = 0
+        final_answer = ""
+        temperature = base_temperature
+    
+        def render_context(expected_next: str = "") -> str:
+            lines = [
+                "=== SYSTEM INSTRUCTION ===",
+                CORE_PROMPT,
+                "=== TOOLS (name -> args schema) ===",
+                _tools_manifest(),
+                "=== TRACE (latest first) ===",
+            ]
+            for s in reversed(steps[-6:]):
+                lines.append(json.dumps(s, ensure_ascii=False))
+            lines.append("=== USER PROMPT ===")
+            lines.append(user_prompt)
+            if expected_next:
+                lines.append(f"=== MODE HINT ===\nExpected next step: {expected_next}")
+            ctx = "\n".join(lines)
+            ctx = re.sub(r"[A-Za-z0-9+/]{200,}={0,2}", "[BASE64_REDACTED]", ctx)
+            return ctx
+    
+        def ensure_budget(ctx: str):
+            if steps and isinstance(steps[-1].get("tokens_used"), dict):
+                last_total = int(steps[-1]["tokens_used"].get("total", 0))
+                if last_total > LAST_USAGE_SUMMARIZE_THRESHOLD:
+                    full = "\n".join(json.dumps(s, ensure_ascii=False) for s in steps)
+                    summary = _summarize_trace(full, trace_id=trace_id)
+                    steps.clear()
+                    steps.append({"trace_id": trace_id, "step": 0, "mode": "reflect", "think": "summary", "answer": summary, "stop": False, "meta": {"summarized": True}})
+                    return
+            if _approx_tokens(ctx) <= MAX_INPUT_TOKENS:
                 return
-        if _approx_tokens(ctx) <= MAX_INPUT_TOKENS:
-            return
-        full = "\n".join(json.dumps(s, ensure_ascii=False) for s in steps)
-        summary = _summarize_trace(full, trace_id=trace_id)
-        steps.clear()
-        steps.append({"trace_id": trace_id, "step": 0, "mode": "reflect", "think": "summary", "answer": summary, "stop": False, "meta": {"summarized": True}})
-
-    last_mode = None
-
-    for step_idx in range(1, max_steps + 1):
-        # checkpoints
-        if checkpoint_every and step_idx > 1 and (step_idx - 1) % checkpoint_every == 0 and steps:
-            try:
-                chk = {
-                    "trace_id": trace_id, "step": (steps[-1]["step"] + 1 if steps else 1),
-                    "mode": "reflect", "think": "checkpoint",
-                    "answer": _critical_check(trace_id, steps, user_prompt),
-                    "stop": False, "confidence": 0.7
-                }
-                sm.log("<step>", json.dumps(chk, ensure_ascii=False))
-                steps.append(chk)
-            except Exception:
-                pass
-
-        temperature = max(0.3, min(0.9, base_temperature + 0.2 * stagnation))
-        expected_next = "act" if (steps and steps[-1]["mode"] == "plan") else ""
-
-        ctx = render_context(expected_next)
-        ensure_budget(ctx)
-
-        def _reason_reward(o: Dict[str, Any]) -> float:
-            ans = str(o.get("answer", ""))
-            feat = 0.0
-            feat += 0.2 if any(ch.isdigit() for ch in ans) else 0.0
-            feat += 0.2 if ("- " in ans or "1." in ans) else 0.0
-            feat += -0.3 if _similarity(final_answer, ans) > 0.85 else 0.0
-            feat += float(o.get("confidence", 0.7)) * 0.4
-            feat += min(len(ans), 600) / 600.0 * 0.2
-            return feat
-
-        candidates: List[Dict[str, Any]] = []
-        if use_liquid:
-            for b in range(max(1, beams)):
-                t = min(0.9, temperature + 0.2 * b)
+            full = "\n".join(json.dumps(s, ensure_ascii=False) for s in steps)
+            summary = _summarize_trace(full, trace_id=trace_id)
+            steps.clear()
+            steps.append({"trace_id": trace_id, "step": 0, "mode": "reflect", "think": "summary", "answer": summary, "stop": False, "meta": {"summarized": True}})
+    
+        last_mode = None
+    
+        for step_idx in range(1, max_steps + 1):
+            # checkpoints
+            if checkpoint_every and step_idx > 1 and (step_idx - 1) % checkpoint_every == 0 and steps:
                 try:
-                    candidates.append(call_liquid(ctx, trace_id=trace_id, temperature=t))
+                    chk = {
+                        "trace_id": trace_id, "step": (steps[-1]["step"] + 1 if steps else 1),
+                        "mode": "reflect", "think": "checkpoint",
+                        "answer": _critical_check(trace_id, steps, user_prompt),
+                        "stop": False, "confidence": 0.7
+                    }
+                    sm.log("<step>", json.dumps(chk, ensure_ascii=False))
+                    steps.append(chk)
                 except Exception:
-                    model = AriannaC(AriannaCConfig())
-                    idx = tokenizer.encode(ctx)
-                    out = model.generate(idx, max_new_tokens=128)
-                    tok = out[0] if out.dim() > 1 else out
-                    candidates.append({"mode": "final", "think": "", "answer": tokenizer.decode(tok), "stop": True, "step": step_idx, "trace_id": trace_id, "confidence": 0.6})
-                    break
-        else:
-            model = AriannaC(AriannaCConfig())
-            idx = tokenizer.encode(ctx)
-            out = model.generate(idx, max_new_tokens=128)
-            tok = out[0] if out.dim() > 1 else out
-            candidates.append({"mode": "final", "think": "", "answer": tokenizer.decode(tok), "stop": True, "step": step_idx, "trace_id": trace_id, "confidence": 0.6})
-
-        obj = max(candidates, key=_reason_reward)
-
-        mode = str(obj.get("mode", "final"))
-        think = str(obj.get("think", ""))
-        answer = str(obj.get("answer", ""))
-        stop = bool(obj.get("stop", mode == "final"))
-        conf = float(obj.get("confidence", 0.7))
-        act = obj.get("action") if isinstance(obj.get("action"), dict) or isinstance(obj.get("action"), list) else None
-        observation: Optional[str] = None
-
-        # enforce allowed transitions
-        if last_mode is not None and mode not in _ALLOWED_TRANSITIONS.get(last_mode, {"final"}):
-            nxt = next(iter(_ALLOWED_TRANSITIONS.get(last_mode, {"final"})))
-            mode, stop = nxt, False
-
-        if mode == "final" and conf < 0.6 and step_idx < max_steps:
-            mode = "reflect"
-            stop = False
-
-        if mode in ("plan", "reflect") and act is None and stagnation >= 1:
-            act = _force_action_from_text(answer)
-            mode = "act"
-            stop = False
-
-        if mode == "act" and act:
-            try:
-                if isinstance(act, list):
-                    results = []
-                    with ThreadPoolExecutor(max_workers=min(4, len(act))) as ex:
-                        futs = []
-                        for a in act:
-                            if not (isinstance(a, dict) and isinstance(a.get("name"), str)):
-                                continue
-                            name = a["name"]
-                            args = a.get("args", {}) if isinstance(a.get("args"), dict) else {}
-                            tool = TOOLS.get(name)
-                            futs.append(ex.submit(lambda t=tool, kw=args, n=name: (n, t(**kw) if t else f"(unknown tool: {n})")))
-                        for f in as_completed(futs):
-                            name, res = f.result()
-                            if isinstance(res, (dict, list)):
-                                res = json.dumps(res, ensure_ascii=False)
-                            results.append({"tool": name, "result": str(res)})
-                    observation = json.dumps(results, ensure_ascii=False)
-                else:
-                    name = act["name"]
-                    args = act.get("args", {}) if isinstance(act.get("args"), dict) else {}
-                    tool = TOOLS.get(name)
-                    obs_res = tool(**args) if tool else f"(unknown tool: {name})"
-                    if isinstance(obs_res, (dict, list)):
-                        observation = json.dumps(obs_res, ensure_ascii=False)
-                    else:
-                        observation = str(obs_res)
-            except Exception as e:
-                observation = json.dumps({"ok": False, "error": str(e)})
-
-        sm.log("<think>", think)
-        sm.log("<answer>", answer)
-        step_obj: Dict[str, Any] = {
-            "trace_id": trace_id, "step": step_idx, "mode": mode,
-            "think": think, "answer": answer, "stop": stop, "confidence": conf
-        }
-        if isinstance(obj.get("tokens_used"), dict):
-            step_obj["tokens_used"] = obj["tokens_used"]
-        if act: step_obj["action"] = act
-        if observation: step_obj["observation"] = observation
-
-        resp_text = f"<think>{think}</think>\n<answer>{answer}</answer>"
-        fmt_score = format_reward(resp_text)
-        steps_score = reasoning_steps_reward(resp_text)
-        step_obj["rewards"] = {"format": fmt_score, "reasoning_steps": steps_score}
-        sm.log("<reward>", json.dumps({"step": step_idx, "format": fmt_score, "reasoning_steps": steps_score}))
-
-        sm.log("<step>", json.dumps(step_obj, ensure_ascii=False))
-        steps.append(step_obj)
-        if mode == "act" and observation:
-            try:
-                comment = verify_step(trace_id, user_prompt, observation)
-                verify_obj = {
-                    "trace_id": trace_id,
-                    "step": step_idx + 0.1,
-                    "mode": "verify",
-                    "think": "",
-                    "answer": comment,
-                    "stop": False,
-                    "confidence": 0.7,
-                }
-                sm.log("<step>", json.dumps(verify_obj, ensure_ascii=False))
-                steps.append(verify_obj)
-            except Exception:
-                pass
-        if answer:
-            final_answer = answer
-
-        if len(steps) >= 2:
-            s_prev = _normalize_step_text(steps[-2])
-            s_curr = _normalize_step_text(steps[-1])
-            if _similarity(s_prev, s_curr) > 0.90:
-                stagnation += 1
+                    pass
+    
+            temperature = max(0.3, min(0.9, base_temperature + 0.2 * stagnation))
+            expected_next = "act" if (steps and steps[-1]["mode"] == "plan") else ""
+    
+            ctx = render_context(expected_next)
+            ensure_budget(ctx)
+    
+            def _reason_reward(o: Dict[str, Any]) -> float:
+                ans = str(o.get("answer", ""))
+                feat = 0.0
+                feat += 0.2 if any(ch.isdigit() for ch in ans) else 0.0
+                feat += 0.2 if ("- " in ans or "1." in ans) else 0.0
+                feat += -0.3 if _similarity(final_answer, ans) > 0.85 else 0.0
+                feat += float(o.get("confidence", 0.7)) * 0.4
+                feat += min(len(ans), 600) / 600.0 * 0.2
+                return feat
+    
+            candidates: List[Dict[str, Any]] = []
+            if use_liquid:
+                for b in range(max(1, beams)):
+                    t = min(0.9, temperature + 0.2 * b)
+                    try:
+                        candidates.append(call_liquid(ctx, trace_id=trace_id, temperature=t))
+                    except Exception:
+                        model = AriannaC(AriannaCConfig())
+                        idx = tokenizer.encode(ctx)
+                        out = model.generate(idx, max_new_tokens=128)
+                        tok = out[0] if out.dim() > 1 else out
+                        candidates.append({"mode": "final", "think": "", "answer": tokenizer.decode(tok), "stop": True, "step": step_idx, "trace_id": trace_id, "confidence": 0.6})
+                        break
             else:
-                stagnation = 0
-
-        if critical_every and (step_idx % critical_every == 0) and step_idx < max_steps:
-            try:
-                crit = _critical_check(trace_id, steps, user_prompt)
-                steps.append({"trace_id": trace_id, "step": step_idx + 0.5, "mode": "reflect", "think": "crit", "answer": crit, "stop": False, "confidence": 0.7})
-            except Exception:
-                pass
-
-        if stagnation >= 1 and step_idx < max_steps:
-            temperature = min(0.9, temperature + 0.2)
-            try:
-                alt_low = call_liquid(render_context(), trace_id=trace_id, temperature=0.2)
-                alt_hi  = call_liquid(render_context(), trace_id=trace_id, temperature=0.6)
-                cands = [obj, alt_low, alt_hi]
-                def score(o: Dict[str, Any]) -> float:
-                    ans = str(o.get("answer",""))
-                    feat = 0.0
-                    feat += 0.2 if any(ch.isdigit() for ch in ans) else 0.0
-                    feat += 0.2 if ("- " in ans or "1." in ans) else 0.0
-                    feat += -0.3 if _similarity(final_answer, ans) > 0.85 else 0.0
-                    feat += float(o.get("confidence", 0.7)) * 0.4
-                    return feat + min(len(ans), 600)/600.0 * 0.2
-                best = max(cands, key=score)
-                if best is not obj:
-                    obj = best
-                    steps[-1]["think"] = str(obj.get("think",""))
-                    steps[-1]["answer"] = str(obj.get("answer",""))
-                    steps[-1]["confidence"] = float(obj.get("confidence", steps[-1]["confidence"]))
-                    final_answer = steps[-1]["answer"] or final_answer
-            except Exception:
-                pass
-
-        if conf < 0.5 and step_idx < max_steps and not stop:
-            try:
-                fixed = _verify_low_confidence(trace_id, user_prompt, final_answer or answer)
-                if fixed and fixed.strip() and _similarity(fixed, final_answer) < 0.92:
-                    steps.append({"trace_id": trace_id, "step": step_idx + 0.6, "mode": "reflect", "think": "verify", "answer": fixed, "stop": False, "confidence": 0.7})
-                    final_answer = fixed
-            except Exception:
-                pass
-
-        last_mode = mode
-        if stop or mode == "final" or stagnation >= progress_patience:
-            break
-
-    text = final_answer or json.dumps(steps[-1], ensure_ascii=False)
-    tokens, entropy, perplexity = estimate_complexity_and_entropy(text)
-    final_conf = float(steps[-1].get("confidence", 0.0)) if steps else 0.0
-    thought_logger.log_turn(text, tokens, entropy, perplexity, final_conf)
-
-    plan = ""
-    for s in steps:
-        if s.get("mode") == "plan":
-            plan = s.get("answer", "")
-            break
-    distill_path = Path("logs/distill.jsonl")
-    distill_path.parent.mkdir(parents=True, exist_ok=True)
-    with distill_path.open("a", encoding="utf-8") as f:
-        f.write(
-            json.dumps(
-                {
-                    "prompt": user_prompt,
-                    "plan": plan,
-                    "answer": text,
-                    "confidence": final_conf,
-                },
-                ensure_ascii=False,
+                model = AriannaC(AriannaCConfig())
+                idx = tokenizer.encode(ctx)
+                out = model.generate(idx, max_new_tokens=128)
+                tok = out[0] if out.dim() > 1 else out
+                candidates.append({"mode": "final", "think": "", "answer": tokenizer.decode(tok), "stop": True, "step": step_idx, "trace_id": trace_id, "confidence": 0.6})
+    
+            obj = max(candidates, key=_reason_reward)
+    
+            mode = str(obj.get("mode", "final"))
+            think = str(obj.get("think", ""))
+            answer = str(obj.get("answer", ""))
+            stop = bool(obj.get("stop", mode == "final"))
+            conf = float(obj.get("confidence", 0.7))
+            act = obj.get("action") if isinstance(obj.get("action"), dict) or isinstance(obj.get("action"), list) else None
+            observation: Optional[str] = None
+    
+            # enforce allowed transitions
+            if last_mode is not None and mode not in _ALLOWED_TRANSITIONS.get(last_mode, {"final"}):
+                nxt = next(iter(_ALLOWED_TRANSITIONS.get(last_mode, {"final"})))
+                mode, stop = nxt, False
+    
+            if mode == "final" and conf < 0.6 and step_idx < max_steps:
+                mode = "reflect"
+                stop = False
+    
+            if mode in ("plan", "reflect") and act is None and stagnation >= 1:
+                act = _force_action_from_text(answer)
+                mode = "act"
+                stop = False
+    
+            if mode == "act" and act:
+                try:
+                    if isinstance(act, list):
+                        results = []
+                        with ThreadPoolExecutor(max_workers=min(4, len(act))) as ex:
+                            futs = []
+                            for a in act:
+                                if not (isinstance(a, dict) and isinstance(a.get("name"), str)):
+                                    continue
+                                name = a["name"]
+                                args = a.get("args", {}) if isinstance(a.get("args"), dict) else {}
+                                tool = TOOLS.get(name)
+                                futs.append(ex.submit(lambda t=tool, kw=args, n=name: (n, t(**kw) if t else f"(unknown tool: {n})")))
+                            for f in as_completed(futs):
+                                name, res = f.result()
+                                if isinstance(res, (dict, list)):
+                                    res = json.dumps(res, ensure_ascii=False)
+                                results.append({"tool": name, "result": str(res)})
+                        observation = json.dumps(results, ensure_ascii=False)
+                    else:
+                        name = act["name"]
+                        args = act.get("args", {}) if isinstance(act.get("args"), dict) else {}
+                        tool = TOOLS.get(name)
+                        obs_res = tool(**args) if tool else f"(unknown tool: {name})"
+                        if isinstance(obs_res, (dict, list)):
+                            observation = json.dumps(obs_res, ensure_ascii=False)
+                        else:
+                            observation = str(obs_res)
+                except Exception as e:
+                    observation = json.dumps({"ok": False, "error": str(e)})
+    
+            sm.log("<think>", think)
+            sm.log("<answer>", answer)
+            step_obj: Dict[str, Any] = {
+                "trace_id": trace_id, "step": step_idx, "mode": mode,
+                "think": think, "answer": answer, "stop": stop, "confidence": conf
+            }
+            if isinstance(obj.get("tokens_used"), dict):
+                step_obj["tokens_used"] = obj["tokens_used"]
+            if act: step_obj["action"] = act
+            if observation: step_obj["observation"] = observation
+    
+            resp_text = f"<think>{think}</think>\n<answer>{answer}</answer>"
+            fmt_score = format_reward(resp_text)
+            steps_score = reasoning_steps_reward(resp_text)
+            step_obj["rewards"] = {"format": fmt_score, "reasoning_steps": steps_score}
+            sm.log("<reward>", json.dumps({"step": step_idx, "format": fmt_score, "reasoning_steps": steps_score}))
+    
+            sm.log("<step>", json.dumps(step_obj, ensure_ascii=False))
+            steps.append(step_obj)
+            if mode == "act" and observation:
+                try:
+                    comment = verify_step(trace_id, user_prompt, observation)
+                    verify_obj = {
+                        "trace_id": trace_id,
+                        "step": step_idx + 0.1,
+                        "mode": "verify",
+                        "think": "",
+                        "answer": comment,
+                        "stop": False,
+                        "confidence": 0.7,
+                    }
+                    sm.log("<step>", json.dumps(verify_obj, ensure_ascii=False))
+                    steps.append(verify_obj)
+                except Exception:
+                    pass
+            if answer:
+                final_answer = answer
+    
+            if len(steps) >= 2:
+                s_prev = _normalize_step_text(steps[-2])
+                s_curr = _normalize_step_text(steps[-1])
+                if _similarity(s_prev, s_curr) > 0.90:
+                    stagnation += 1
+                else:
+                    stagnation = 0
+    
+            if critical_every and (step_idx % critical_every == 0) and step_idx < max_steps:
+                try:
+                    crit = _critical_check(trace_id, steps, user_prompt)
+                    steps.append({"trace_id": trace_id, "step": step_idx + 0.5, "mode": "reflect", "think": "crit", "answer": crit, "stop": False, "confidence": 0.7})
+                except Exception:
+                    pass
+    
+            if stagnation >= 1 and step_idx < max_steps:
+                temperature = min(0.9, temperature + 0.2)
+                try:
+                    alt_low = call_liquid(render_context(), trace_id=trace_id, temperature=0.2)
+                    alt_hi  = call_liquid(render_context(), trace_id=trace_id, temperature=0.6)
+                    cands = [obj, alt_low, alt_hi]
+                    def score(o: Dict[str, Any]) -> float:
+                        ans = str(o.get("answer",""))
+                        feat = 0.0
+                        feat += 0.2 if any(ch.isdigit() for ch in ans) else 0.0
+                        feat += 0.2 if ("- " in ans or "1." in ans) else 0.0
+                        feat += -0.3 if _similarity(final_answer, ans) > 0.85 else 0.0
+                        feat += float(o.get("confidence", 0.7)) * 0.4
+                        return feat + min(len(ans), 600)/600.0 * 0.2
+                    best = max(cands, key=score)
+                    if best is not obj:
+                        obj = best
+                        steps[-1]["think"] = str(obj.get("think",""))
+                        steps[-1]["answer"] = str(obj.get("answer",""))
+                        steps[-1]["confidence"] = float(obj.get("confidence", steps[-1]["confidence"]))
+                        final_answer = steps[-1]["answer"] or final_answer
+                except Exception:
+                    pass
+    
+            if conf < 0.5 and step_idx < max_steps and not stop:
+                try:
+                    fixed = _verify_low_confidence(trace_id, user_prompt, final_answer or answer)
+                    if fixed and fixed.strip() and _similarity(fixed, final_answer) < 0.92:
+                        steps.append({"trace_id": trace_id, "step": step_idx + 0.6, "mode": "reflect", "think": "verify", "answer": fixed, "stop": False, "confidence": 0.7})
+                        final_answer = fixed
+                except Exception:
+                    pass
+    
+            last_mode = mode
+            if stop or mode == "final" or stagnation >= progress_patience:
+                break
+    
+        text = final_answer or json.dumps(steps[-1], ensure_ascii=False)
+        tokens, entropy, perplexity = estimate_complexity_and_entropy(text)
+        final_conf = float(steps[-1].get("confidence", 0.0)) if steps else 0.0
+        thought_logger.log_turn(text, tokens, entropy, perplexity, final_conf)
+    
+        plan = ""
+        for s in steps:
+            if s.get("mode") == "plan":
+                plan = s.get("answer", "")
+                break
+        distill_path = Path("logs/distill.jsonl")
+        distill_path.parent.mkdir(parents=True, exist_ok=True)
+        with distill_path.open("a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "prompt": user_prompt,
+                        "plan": plan,
+                        "answer": text,
+                        "confidence": final_conf,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
             )
-            + "\n"
-        )
-    return text
+        return text
+    with SelfMonitor() as sm:
+        return _run(sm)
 
 def tree_reason_loop(
     prompt: Optional[str] = None,
@@ -1319,28 +1330,28 @@ def tree_reason_loop(
     return best_answer
 
 def multi_reason(prompt: Optional[str] = None, paths: int = 5, **reason_kwargs) -> str:
-    sm = SelfMonitor()
-    temps = [0.2 + 0.6 * i / max(1, paths - 1) for i in range(max(1, paths))]
-    results: List[Dict[str, Any]] = []
-    for t in temps:
-        ans = reason_loop(prompt, base_temperature=t, **reason_kwargs)
-        conf = 1.0 - estimate_complexity_and_entropy(ans)[1]
-        entry = {"temperature": t, "answer": ans, "confidence": conf}
-        sm.log("<path>", json.dumps(entry, ensure_ascii=False))
-        results.append(entry)
+    with SelfMonitor() as sm:
+        temps = [0.2 + 0.6 * i / max(1, paths - 1) for i in range(max(1, paths))]
+        results: List[Dict[str, Any]] = []
+        for t in temps:
+            ans = reason_loop(prompt, base_temperature=t, **reason_kwargs)
+            conf = 1.0 - estimate_complexity_and_entropy(ans)[1]
+            entry = {"temperature": t, "answer": ans, "confidence": conf}
+            sm.log("<path>", json.dumps(entry, ensure_ascii=False))
+            results.append(entry)
 
-    counts = Counter(r["answer"] for r in results)
-    unique_answers = list(counts.keys())
+        counts = Counter(r["answer"] for r in results)
+        unique_answers = list(counts.keys())
 
-    def score(ans: str) -> float:
-        freq = counts[ans]
-        avg_conf = sum(r["confidence"] for r in results if r["answer"] == ans) / freq
-        diversities = [1 - _similarity(ans, other) for other in unique_answers if other != ans]
-        diversity = sum(diversities) / len(diversities) if diversities else 1.0
-        return freq + avg_conf + diversity
+        def score(ans: str) -> float:
+            freq = counts[ans]
+            avg_conf = sum(r["confidence"] for r in results if r["answer"] == ans) / freq
+            diversities = [1 - _similarity(ans, other) for other in unique_answers if other != ans]
+            diversity = sum(diversities) / len(diversities) if diversities else 1.0
+            return freq + avg_conf + diversity
 
-    best = max(unique_answers, key=score)
-    return best
+        best = max(unique_answers, key=score)
+        return best
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Mini GPT (toy CPU fallback) — W2A8 for Linear when apply_quant=True
@@ -1523,87 +1534,90 @@ def generate_text(
                 prompt = "\n".join(docs) + "\n\n" + prompt
         except Exception:
             pass
-    sm = SelfMonitor()
-    if use_memory:
-        examples = sm.search_embedding(prompt, limit=memory_limit) or sm.search(prompt, limit=memory_limit)
-        if examples:
-            combined = "\n".join(f"PrevPrompt: {p}\nPrevOutput: {o}" for p, o in examples)
-            prompt = f"{combined}\n\nCurrent:\n{prompt}"
-    if use_liquid:
-        try:
-            plan_obj = call_liquid(f"Plan the steps to answer: {prompt}", temperature=0.3)
-            plan = str(plan_obj.get("answer", ""))
-            obj = call_liquid(prompt, temperature=0.3)
-            think = str(obj.get("think", ""))
-            answer = str(obj.get("answer", ""))
+    def _run(sm: SelfMonitor) -> str | tuple[str, dict[str, float | int]]:
+        prompt_local = prompt
+        if use_memory:
+            examples = sm.search_embedding(prompt_local, limit=memory_limit) or sm.search(prompt_local, limit=memory_limit)
+            if examples:
+                combined = "\n".join(f"PrevPrompt: {p}\nPrevOutput: {o}" for p, o in examples)
+                prompt_local = f"{combined}\n\nCurrent:\n{prompt_local}"
+        if use_liquid:
             try:
-                verify_obj = call_liquid(
-                    f"Question: {prompt}\nAnswer: {answer}\nverify the previous answer",
-                    temperature=0.0,
-                )
-                verified = str(verify_obj.get("answer", ""))
-                if verified:
-                    answer = verified
-            except Exception:
-                pass
-            text = f"<plan>{plan}</plan>\n<think>{think}</think>\n<answer>{answer}</answer>"
-            sm.log(prompt, text)
-            tokens, entropy, perplexity = estimate_complexity_and_entropy(text)
-            conf = float(obj.get("confidence", 1.0 - entropy))
-            rec = thought_logger.log_turn(text, tokens, entropy, perplexity, conf)
-            if self_reflect:
-                crit = reflect(prompt, text, use_liquid=True)
-                if "good" not in crit.lower():
-                    repair = call_liquid(
-                        f"Revise using this critique. Return JSON. Draft: {text}\nCritique: {crit}",
+                plan_obj = call_liquid(f"Plan the steps to answer: {prompt_local}", temperature=0.3)
+                plan = str(plan_obj.get("answer", ""))
+                obj = call_liquid(prompt_local, temperature=0.3)
+                think = str(obj.get("think", ""))
+                answer = str(obj.get("answer", ""))
+                try:
+                    verify_obj = call_liquid(
+                        f"Question: {prompt_local}\nAnswer: {answer}\nverify the previous answer",
                         temperature=0.0,
                     )
-                    text = str(repair.get("answer", text))
-                    sm.log("revise", text)
-            if log_reasoning:
-                return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
-            return text
-        except Exception:
-            model = AriannaC(AriannaCConfig())
-            idx = tokenizer.encode(prompt)
-            out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
-            tok = out[0] if out.dim() > 1 else out
-            text = tokenizer.decode(tok)
-            if self_reflect:
-                crit = reflect(prompt, text, use_liquid=False)
-                if "good" not in crit.lower():
-                    idx = tokenizer.encode(f"Revise using this critique. Draft: {text}\nCritique: {crit}")
-                    out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
-                    tok = out[0] if out.dim() > 1 else out
-                    text = tokenizer.decode(tok)
-                    sm.log("revise", text)
-            sm.log(prompt, text)
-            tokens, entropy, perplexity = estimate_complexity_and_entropy(text, model)
-            conf = 1.0 - entropy
-            rec = thought_logger.log_turn(text, tokens, entropy, perplexity, conf)
-            if log_reasoning:
-                return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
-            return text
-    model = AriannaC(AriannaCConfig())
-    idx = tokenizer.encode(prompt)
-    out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
-    tok = out[0] if out.dim() > 1 else out
-    text = tokenizer.decode(tok)
-    if self_reflect:
-        crit = reflect(prompt, text, use_liquid=False)
-        if "good" not in crit.lower():
-            idx = tokenizer.encode(f"Revise using this critique. Draft: {text}\nCritique: {crit}")
-            out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
-            tok = out[0] if out.dim() > 1 else out
-            text = tokenizer.decode(tok)
-            sm.log("revise", text)
-    sm.log(prompt, text)
-    tokens, entropy, perplexity = estimate_complexity_and_entropy(text, model)
-    conf = 1.0 - entropy
-    rec = thought_logger.log_turn(text, tokens, entropy, perplexity, conf)
-    if log_reasoning:
-        return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
-    return text
+                    verified = str(verify_obj.get("answer", ""))
+                    if verified:
+                        answer = verified
+                except Exception:
+                    pass
+                text = f"<plan>{plan}</plan>\n<think>{think}</think>\n<answer>{answer}</answer>"
+                sm.log(prompt_local, text)
+                tokens, entropy, perplexity = estimate_complexity_and_entropy(text)
+                conf = float(obj.get("confidence", 1.0 - entropy))
+                rec = thought_logger.log_turn(text, tokens, entropy, perplexity, conf)
+                if self_reflect:
+                    crit = reflect(prompt_local, text, use_liquid=True)
+                    if "good" not in crit.lower():
+                        repair = call_liquid(
+                            f"Revise using this critique. Return JSON. Draft: {text}\nCritique: {crit}",
+                            temperature=0.0,
+                        )
+                        text = str(repair.get("answer", text))
+                        sm.log("revise", text)
+                if log_reasoning:
+                    return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
+                return text
+            except Exception:
+                model = AriannaC(AriannaCConfig())
+                idx = tokenizer.encode(prompt_local)
+                out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
+                tok = out[0] if out.dim() > 1 else out
+                text = tokenizer.decode(tok)
+                if self_reflect:
+                    crit = reflect(prompt_local, text, use_liquid=False)
+                    if "good" not in crit.lower():
+                        idx = tokenizer.encode(f"Revise using this critique. Draft: {text}\nCritique: {crit}")
+                        out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
+                        tok = out[0] if out.dim() > 1 else out
+                        text = tokenizer.decode(tok)
+                        sm.log("revise", text)
+                sm.log(prompt_local, text)
+                tokens, entropy, perplexity = estimate_complexity_and_entropy(text, model)
+                conf = 1.0 - entropy
+                rec = thought_logger.log_turn(text, tokens, entropy, perplexity, conf)
+                if log_reasoning:
+                    return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
+                return text
+        model = AriannaC(AriannaCConfig())
+        idx = tokenizer.encode(prompt_local)
+        out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
+        tok = out[0] if out.dim() > 1 else out
+        text = tokenizer.decode(tok)
+        if self_reflect:
+            crit = reflect(prompt_local, text, use_liquid=False)
+            if "good" not in crit.lower():
+                idx = tokenizer.encode(f"Revise using this critique. Draft: {text}\nCritique: {crit}")
+                out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0)
+                tok = out[0] if out.dim() > 1 else out
+                text = tokenizer.decode(tok)
+                sm.log("revise", text)
+        sm.log(prompt_local, text)
+        tokens, entropy, perplexity = estimate_complexity_and_entropy(text, model)
+        conf = 1.0 - entropy
+        rec = thought_logger.log_turn(text, tokens, entropy, perplexity, conf)
+        if log_reasoning:
+            return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
+        return text
+    with SelfMonitor() as sm:
+        return _run(sm)
 
 def generate_with_think(
     prompt: Optional[str] = None,

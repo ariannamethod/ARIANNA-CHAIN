@@ -14,6 +14,12 @@ class DummyMonitor:
     def log(self, *_args, **_kwargs):
         pass
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        pass
+
 
 def _patch_env():
     return (

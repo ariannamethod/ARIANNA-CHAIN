@@ -90,6 +90,7 @@ def test_reason_loop_alternates_and_logs() -> None:
         patch("arianna_chain.quantize_2bit", lambda _: None),
         patch("arianna_chain.SelfMonitor.__init__", return_value=None),
         patch("arianna_chain.SelfMonitor.log") as mock_log,
+        patch("arianna_chain.SelfMonitor.close"),
     ):
         result = reason_loop("Q", max_steps=1)
 
@@ -118,6 +119,7 @@ def test_reason_loop_writes_distill_log(tmp_path, monkeypatch) -> None:
         patch("arianna_chain.quantize_2bit", lambda _: None),
         patch("arianna_chain.SelfMonitor.__init__", return_value=None),
         patch("arianna_chain.SelfMonitor.log"),
+        patch("arianna_chain.SelfMonitor.close"),
         patch("arianna_chain.call_liquid", side_effect=RuntimeError),
     ):
         reason_loop("Q", max_steps=1)
@@ -141,6 +143,7 @@ def test_reason_loop_beam_selects_highest_scoring() -> None:
         patch("arianna_chain.call_liquid", side_effect=responses),
         patch("arianna_chain.SelfMonitor.__init__", return_value=None),
         patch("arianna_chain.SelfMonitor.log"),
+        patch("arianna_chain.SelfMonitor.close"),
     ):
         result = reason_loop("Q", max_steps=1, beams=2)
 
@@ -168,6 +171,7 @@ def test_reason_loop_verifies_after_act() -> None:
         patch("arianna_chain.verify_step", return_value="looks good") as mock_verify,
         patch("arianna_chain.SelfMonitor.__init__", return_value=None),
         patch("arianna_chain.SelfMonitor.log") as mock_log,
+        patch("arianna_chain.SelfMonitor.close"),
     ):
         reason_loop("Q", max_steps=2)
 
@@ -190,6 +194,7 @@ def test_reason_loop_uses_retrieval() -> None:
         patch("arianna_chain.call_liquid", side_effect=responses),
         patch("arianna_chain.SelfMonitor.__init__", return_value=None),
         patch("arianna_chain.SelfMonitor.log"),
+        patch("arianna_chain.SelfMonitor.close"),
     ):
         reason_loop("Q", max_steps=1, retrieve=True)
 
@@ -226,6 +231,7 @@ def test_multi_reason_majority_selection() -> None:
         patch("arianna_chain.reason_loop", side_effect=fake_reason) as mock_loop,
         patch("arianna_chain.SelfMonitor.__init__", return_value=None),
         patch("arianna_chain.SelfMonitor.log") as mock_log,
+        patch("arianna_chain.SelfMonitor.close"),
     ):
         result = multi_reason("Q", paths=4)
 
