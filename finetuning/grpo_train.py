@@ -15,20 +15,17 @@ from typing import Dict, Iterator, List, Tuple
 import torch
 
 from arianna_chain import AriannaC, AriannaCConfig, tokenizer
+from logging_utils import get_logger
 
 
 DEFAULT_LOGDIR = Path("logs/grpo")
 DEFAULT_LOGDIR.mkdir(parents=True, exist_ok=True)
 
-logger = logging.getLogger("grpo")
-logger.setLevel(logging.INFO)
-formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+logger = get_logger("grpo")
 _file_handler = logging.FileHandler(DEFAULT_LOGDIR / "train.log")
-_file_handler.setFormatter(formatter)
-_stream_handler = logging.StreamHandler()
-_stream_handler.setFormatter(formatter)
+_file_handler.setFormatter(logger.handlers[0].formatter)
+_file_handler.addFilter(logger.handlers[0].filters[0])
 logger.addHandler(_file_handler)
-logger.addHandler(_stream_handler)
 
 
 def iter_dataset(path: str, min_confidence: float = 0.0) -> Iterator[Dict[str, str]]:

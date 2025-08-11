@@ -22,6 +22,8 @@ from logging.handlers import RotatingFileHandler
 from functools import wraps
 from collections import OrderedDict
 
+from logging_utils import get_logger
+
 from flask import Flask, request, jsonify, Response, make_response
 from openai import OpenAI
 
@@ -29,17 +31,19 @@ from arianna_core.config import settings
 
 app = Flask(__name__)
 
+logger = get_logger("server")
 LOG_DIR = os.path.join("logs", "server")
 os.makedirs(LOG_DIR, exist_ok=True)
-handler = RotatingFileHandler(
+_file_handler = RotatingFileHandler(
     os.path.join(LOG_DIR, "server.log"),
     maxBytes=2_000_000,
     backupCount=3,
     encoding="utf-8",
 )
-handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-app.logger.setLevel(logging.INFO)
-app.logger.addHandler(handler)
+_file_handler.setFormatter(logger.handlers[0].formatter)
+_file_handler.addFilter(logger.handlers[0].filters[0])
+logger.addHandler(_file_handler)
+app.logger = logger
 
 if not settings.openai_api_key:
     app.logger.critical("OPENAI_API_KEY не задан — выход")

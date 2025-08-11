@@ -26,6 +26,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from arianna_core.config import settings
 
+from logging_utils import get_logger, _SECRET_PATTERNS
+
 import numpy as np
 try:
     import faiss  # type: ignore
@@ -33,6 +35,8 @@ except Exception:  # pragma: no cover
     faiss = None
 import torch
 import torch.nn as nn
+
+logger = get_logger(__name__)
 
 from arianna_core import (
     AriannaC,
@@ -107,11 +111,6 @@ class VectorStore:
 # ────────────────────────────────────────────────────────────────────────────────
 # Tools (safe & redacted) + manifest
 # ────────────────────────────────────────────────────────────────────────────────
-_SECRET_PATTERNS = [
-    re.compile(r"sk-[A-Za-z0-9]{20,}"),
-    re.compile(r"(?i)(api[_-]?key|token)[\"'\s:]*[A-Za-z0-9\-_]{16,}"),
-    re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"),  # JWT-ish
-]
 
 def _redact(text: str) -> str:
     red = text
