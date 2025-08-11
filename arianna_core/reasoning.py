@@ -7,6 +7,7 @@ import re
 import sqlite3
 import time
 import math
+import threading
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -144,11 +145,37 @@ thought_logger = ThoughtComplexityLogger()
 
 # ---- SelfMonitor -------------------------------------------------------------
 
+
 class SelfMonitor:
+    """SQLite-backed monitor for prompts, notes and links.
+
+    The monitor maintains a single SQLite connection. SQLite connections are
+    not inherently thread-safe, so operations are synchronised with a
+    :class:`threading.Lock`. For heavy concurrent workloads prefer using one
+    connection per process or an external connection pool.
+
+    Parameters
+    ----------
+    db_path:
+        Path to the SQLite database file.
+    use_embeddings:
+        Whether to compute and store text embeddings.
+    check_same_thread:
+        Passed to :func:`sqlite3.connect`; defaults to ``True`` which restricts
+        the connection to the creating thread.
+    """
+
     _snapshotted = False
 
-    def __init__(self, db_path: str = "arianna_memory.sqlite", use_embeddings: bool | None = None):
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+    def __init__(
+        self,
+        db_path: str = "arianna_memory.sqlite",
+        use_embeddings: bool | None = None,
+        *,
+        check_same_thread: bool = True,
+    ):
+        self.lock = threading.Lock()
+        self.conn = sqlite3.connect(db_path, check_same_thread=check_same_thread)
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA synchronous=NORMAL;")
         env_flag = os.getenv("ARIANNA_DISABLE_EMBED", "").lower() in {"1", "true", "yes"}
@@ -290,39 +317,45 @@ class SelfMonitor:
 
     # -- logging --------------------------------------------------------------
     def log(self, prompt: str, output: str) -> None:
-        sha = hashlib.sha256(prompt.encode("utf-8", errors="ignore")).hexdigest()
-        cur = self.conn.cursor()
-        cur.execute(
-            "INSERT INTO logs(ts, prompt, output, sha256) VALUES (?,?,?,?)",
-            (time.time(), prompt, output, sha),
-        )
-        cur.execute("INSERT INTO prompts_index(prompt, output) VALUES (?,?)", (prompt, output))
-        if self._ensure_embed_model():
-            vec = self.embed_model.encode([prompt])[0].astype("float32")
+        with self.lock:
+            sha = hashlib.sha256(prompt.encode("utf-8", errors="ignore")).hexdigest()
+            cur = self.conn.cursor()
             cur.execute(
-                "INSERT OR REPLACE INTO embeddings(sha256, embedding) VALUES (?,?)",
-                (sha, sqlite3.Binary(vec.tobytes())),
+                "INSERT INTO logs(ts, prompt, output, sha256) VALUES (?,?,?,?)",
+                (time.time(), prompt, output, sha),
             )
-            self._add_to_index(sha, vec)
-        self.conn.commit()
+            cur.execute(
+                "INSERT INTO prompts_index(prompt, output) VALUES (?,?)",
+                (prompt, output),
+            )
+            if self._ensure_embed_model():
+                vec = self.embed_model.encode([prompt])[0].astype("float32")
+                cur.execute(
+                    "INSERT OR REPLACE INTO embeddings(sha256, embedding) VALUES (?,?)",
+                    (sha, sqlite3.Binary(vec.tobytes())),
+                )
+                self._add_to_index(sha, vec)
+            self.conn.commit()
 
     def note(self, text: str) -> None:
-        sha = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
-        cur = self.conn.cursor()
-        cur.execute(
-            "INSERT INTO notes(ts, text, sha256) VALUES (?, ?, ?)",
-            (time.time(), text, sha),
-        )
-        cur.execute("INSERT INTO notes_index(text) VALUES (?)", (text,))
-        self.conn.commit()
+        with self.lock:
+            sha = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+            cur = self.conn.cursor()
+            cur.execute(
+                "INSERT INTO notes(ts, text, sha256) VALUES (?, ?, ?)",
+                (time.time(), text, sha),
+            )
+            cur.execute("INSERT INTO notes_index(text) VALUES (?)", (text,))
+            self.conn.commit()
 
     def link_prompt(self, prompt_sha: str, note_sha: str, relation: str) -> None:
-        cur = self.conn.cursor()
-        cur.execute(
-            "INSERT INTO links(src_sha, dst_sha, relation) VALUES (?,?,?)",
-            (prompt_sha, note_sha, relation),
-        )
-        self.conn.commit()
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "INSERT INTO links(src_sha, dst_sha, relation) VALUES (?,?,?)",
+                (prompt_sha, note_sha, relation),
+            )
+            self.conn.commit()
 
     def graph_search(self, start_sha: str, depth: int) -> list[tuple[str, str, str]]:
         cur = self.conn.cursor()
