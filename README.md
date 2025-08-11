@@ -139,7 +139,8 @@ write in light. When insight stirs, act.
 ⸻
 
 Endpoints
-	•	POST /generate — one-shot generation with optional log_reasoning
+	•	GET  /health       — service status and basic metrics
+	•	POST /generate     — one-shot generation with optional log_reasoning
 	•	GET  /generate_sse — streaming events (plan/reason/repair/output)
 
 Auth (optional): Authorization: Bearer <ARIANNA_SERVER_TOKEN>
