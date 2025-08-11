@@ -1,4 +1,4 @@
-from arianna_chain import AriannaC, AriannaCConfig, tokenizer
+from arianna_core import AriannaC, AriannaCConfig, tokenizer
 
 
 def test_forward():

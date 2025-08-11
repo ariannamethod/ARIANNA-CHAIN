@@ -2,7 +2,8 @@ import os
 import hashlib
 import numpy as np
 
-from arianna_chain import SelfMonitor, TOOLS
+from arianna_chain import TOOLS
+from arianna_core import SelfMonitor
 
 
 def test_search_exact(tmp_path):

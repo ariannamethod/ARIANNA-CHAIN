@@ -1,5 +1,5 @@
 import torch
-from arianna_chain import _pack2, _unpack2, LinearW2A8
+from arianna_core import _pack2, _unpack2, LinearW2A8
 
 
 def test_pack_unpack_roundtrip() -> None:

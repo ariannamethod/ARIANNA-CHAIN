@@ -1,7 +1,8 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from arianna_chain import SelfMonitor, generate_text, tokenizer
+from arianna_chain import generate_text
+from arianna_core import SelfMonitor, tokenizer
 
 
 def test_generate_text_uses_provided_monitor() -> None:
