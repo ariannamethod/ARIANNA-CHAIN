@@ -52,7 +52,8 @@ if not settings.openai_api_key:
 # ────────────────────────────────────────────────────────────────────────────────
 # Конфиг
 # ────────────────────────────────────────────────────────────────────────────────
-SECRET               = settings.arianna_server_token
+def _secret() -> str:
+    return os.getenv("ARIANNA_SERVER_TOKEN", settings.arianna_server_token)
 MODEL_DEFAULT        = settings.arianna_model
 MODEL_LIGHT          = settings.arianna_model_light or MODEL_DEFAULT
 MODEL_HEAVY          = settings.arianna_model_heavy or MODEL_DEFAULT
@@ -85,9 +86,10 @@ def _extract_auth_token() -> str:
 def require_auth(fn: Callable):
     @wraps(fn)
     def inner(*args, **kwargs):
-        if SECRET:
+        secret = _secret()
+        if secret:
             token = _extract_auth_token()
-            if token != SECRET:
+            if token != secret:
                 return jsonify({"error": "unauthorized"}), 401
         return fn(*args, **kwargs)
     return inner

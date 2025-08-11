@@ -101,6 +101,11 @@ OPENAI_API_KEY=...
 ARIANNA_SERVER_TOKEN=...
 ```
 
+The worker automatically constructs `ARIANNA_SERVER_URL` using Railway's
+`RAILWAY_STATIC_URL`/`RAILWAY_URL` variables when available. Set
+`ARIANNA_SERVER_URL` (and `ARIANNA_SERVER_SSE_URL`) manually if you deploy
+outside Railway or need a custom endpoint.
+
 Then:
 
 ```

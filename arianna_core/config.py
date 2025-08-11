@@ -45,6 +45,23 @@ def _tuple(v: str) -> Tuple[str, ...]:
     return tuple(x.strip() for x in v.split(";") if x.strip())
 
 
+def _railway_host() -> str | None:
+    host = os.getenv("RAILWAY_STATIC_URL") or os.getenv("RAILWAY_URL")
+    if host:
+        return host if host.startswith("http") else f"https://{host}"
+    return None
+
+
+def _default_server_url() -> str:
+    host = _railway_host()
+    return f"{host.rstrip('/')}/generate" if host else "http://127.0.0.1:8000/generate"
+
+
+def _default_server_sse_url() -> str:
+    host = _railway_host()
+    return f"{host.rstrip('/')}/generate_sse" if host else "http://127.0.0.1:8000/generate_sse"
+
+
 @dataclass(frozen=True)
 class Settings:
     """Container for environment configuration."""
@@ -59,13 +76,11 @@ class Settings:
         default_factory=lambda: _get_env("ARIANNA_SERVER_TOKEN", "")
     )
     arianna_server_url: str = field(
-        default_factory=lambda: _get_env(
-            "ARIANNA_SERVER_URL", "http://127.0.0.1:8000/generate"
-        )
+        default_factory=lambda: _get_env("ARIANNA_SERVER_URL", _default_server_url())
     )
     arianna_server_sse_url: str = field(
         default_factory=lambda: _get_env(
-            "ARIANNA_SERVER_SSE_URL", "http://127.0.0.1:8000/generate_sse"
+            "ARIANNA_SERVER_SSE_URL", _default_server_sse_url()
         )
     )
     telegram_token: str | None = field(
