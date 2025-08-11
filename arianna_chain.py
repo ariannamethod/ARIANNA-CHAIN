@@ -16,7 +16,6 @@ import difflib
 import hashlib
 import json
 import math
-import os
 import re
 import time
 import uuid
@@ -24,6 +23,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from arianna_core.config import settings
 
 import numpy as np
 try:
@@ -244,8 +245,8 @@ def _tools_manifest() -> str:
 def _approx_tokens(text: str) -> int:
     return max(1, len(text.encode("utf-8", errors="ignore")) // 4)
 
-MAX_INPUT_TOKENS = int(os.getenv("ARIANNA_MAX_TOKENS", "3000"))
-LAST_USAGE_SUMMARIZE_THRESHOLD = int(os.getenv("ARIANNA_LAST_USAGE_SUMMARY_TOKENS", "8000"))
+MAX_INPUT_TOKENS = settings.arianna_max_tokens
+LAST_USAGE_SUMMARIZE_THRESHOLD = settings.arianna_last_usage_summary_tokens
 
 def _summarize_trace(trace_text: str, *, trace_id: str) -> str:
     prompt = (

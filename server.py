@@ -25,6 +25,8 @@ from collections import OrderedDict
 from flask import Flask, request, jsonify, Response, make_response
 from openai import OpenAI
 
+from arianna_core.config import settings
+
 app = Flask(__name__)
 
 LOG_DIR = os.path.join("logs", "server")
@@ -39,33 +41,33 @@ handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 app.logger.setLevel(logging.INFO)
 app.logger.addHandler(handler)
 
-if not os.getenv("OPENAI_API_KEY"):
+if not settings.openai_api_key:
     app.logger.critical("OPENAI_API_KEY не задан — выход")
     raise RuntimeError("OPENAI_API_KEY is required")
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Конфиг
 # ────────────────────────────────────────────────────────────────────────────────
-SECRET               = os.getenv("ARIANNA_SERVER_TOKEN", "")
-MODEL_DEFAULT        = os.getenv("ARIANNA_MODEL", "gpt-4.1")
-MODEL_LIGHT          = os.getenv("ARIANNA_MODEL_LIGHT", MODEL_DEFAULT)
-MODEL_HEAVY          = os.getenv("ARIANNA_MODEL_HEAVY", MODEL_DEFAULT)
-HEAVY_TRIGGER_TOKENS = int(os.getenv("HEAVY_TRIGGER_TOKENS", "3500"))
-HEAVY_HINTS          = tuple(x.strip() for x in os.getenv("HEAVY_HINTS", "deep analysis;докажи;пошагово;reason;рефлексия").split(";") if x.strip())
+SECRET               = settings.arianna_server_token
+MODEL_DEFAULT        = settings.arianna_model
+MODEL_LIGHT          = settings.arianna_model_light or MODEL_DEFAULT
+MODEL_HEAVY          = settings.arianna_model_heavy or MODEL_DEFAULT
+HEAVY_TRIGGER_TOKENS = settings.heavy_trigger_tokens
+HEAVY_HINTS          = settings.heavy_hints
 
-PROMPT_LIMIT_CHARS   = int(os.getenv("PROMPT_LIMIT_CHARS",   "16000"))
-CACHE_TTL            = int(os.getenv("CACHE_TTL_SECONDS",    "120"))
-CACHE_MAX            = int(os.getenv("CACHE_MAX_ITEMS",      "256"))
-SCHEMA_VERSION       = os.getenv("SCHEMA_VERSION",           "1.3")
-RATE_CAPACITY        = int(os.getenv("RATE_CAPACITY",        "20"))
-RATE_REFILL_PER_SEC  = float(os.getenv("RATE_REFILL_PER_SEC","0.5"))
-RATE_STATE_TTL       = int(os.getenv("RATE_STATE_TTL",       "3600"))
-RATE_STATE_CLEANUP   = int(os.getenv("RATE_STATE_CLEANUP",   "1000"))
-HEARTBEAT_EVERY      = int(os.getenv("SSE_HEARTBEAT_EVERY",  "10"))
-TIME_PING_SECONDS    = float(os.getenv("SSE_TIME_HEARTBEAT_SEC", "12"))
+PROMPT_LIMIT_CHARS   = settings.prompt_limit_chars
+CACHE_TTL            = settings.cache_ttl_seconds
+CACHE_MAX            = settings.cache_max_items
+SCHEMA_VERSION       = settings.schema_version
+RATE_CAPACITY        = settings.rate_capacity
+RATE_REFILL_PER_SEC  = settings.rate_refill_per_sec
+RATE_STATE_TTL       = settings.rate_state_ttl
+RATE_STATE_CLEANUP   = settings.rate_state_cleanup
+HEARTBEAT_EVERY      = settings.sse_heartbeat_every
+TIME_PING_SECONDS    = settings.sse_time_heartbeat_sec
 TIME_SENSITIVE_HINTS = ("now", "today", "сейчас", "сегодня", "latest", "свеж", "текущ")
-CODE_BLOCK_LIMIT     = int(os.getenv("CODE_BLOCK_LIMIT", "65536"))
-SIMHASH_HAMMING_THR  = int(os.getenv("SIMHASH_HAMMING_THR", "3"))
+CODE_BLOCK_LIMIT     = settings.code_block_limit
+SIMHASH_HAMMING_THR  = settings.simhash_hamming_thr
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Авторизация
@@ -247,9 +249,9 @@ def _semantic_cache_get_fuzzy(target_key_prefix: str, prompt: str) -> Optional[D
 # OpenAI client
 # ────────────────────────────────────────────────────────────────────────────────
 def _openai_client() -> OpenAI:
-    key = os.getenv("OPENAI_API_KEY")
-    base = os.getenv("OPENAI_BASE_URL")
-    return OpenAI(api_key=key, base_url=base) if base else OpenAI(api_key=key)
+    if settings.openai_base_url:
+        return OpenAI(api_key=settings.openai_api_key, base_url=settings.openai_base_url)
+    return OpenAI(api_key=settings.openai_api_key)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # JSON-schema + валидация
@@ -803,5 +805,5 @@ def generate_sse():
         )
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
+    port = settings.port
     app.run(host="0.0.0.0", port=port, threaded=True)

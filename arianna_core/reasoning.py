@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import sqlite3
 import time
@@ -22,6 +21,7 @@ try:  # pragma: no cover - optional dependency
 except Exception:  # pragma: no cover
     faiss = None
 
+from .config import settings
 from .tokenizer import tokenizer
 
 
@@ -151,7 +151,7 @@ class SelfMonitor:
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA synchronous=NORMAL;")
-        env_flag = os.getenv("ARIANNA_DISABLE_EMBED", "").lower() in {"1", "true", "yes"}
+        env_flag = settings.arianna_disable_embed
         self.use_embeddings = use_embeddings if use_embeddings is not None else not env_flag
         self.embed_model = None
         self.faiss_index = None
@@ -162,7 +162,7 @@ class SelfMonitor:
         self.ids_file = self.index_dir / "ids.json"
         self._load_faiss_index()
         self._init_db()
-        snapshot_flag = os.getenv("ARIANNA_SNAPSHOT_CODEBASE", "0").lower() in {"1", "true", "yes"}
+        snapshot_flag = settings.arianna_snapshot_codebase
         if snapshot_flag and not SelfMonitor._snapshotted:
             self.snapshot_codebase()
             SelfMonitor._snapshotted = True
@@ -279,10 +279,7 @@ class SelfMonitor:
             try:
                 from sentence_transformers import SentenceTransformer  # type: ignore
 
-                name = os.getenv(
-                    "ARIANNA_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
-                )
-                self.embed_model = SentenceTransformer(name)
+                self.embed_model = SentenceTransformer(settings.arianna_embed_model)
             except Exception:  # pragma: no cover
                 self.embed_model = None
                 self.use_embeddings = False
