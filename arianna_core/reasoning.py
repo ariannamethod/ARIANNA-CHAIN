@@ -174,7 +174,7 @@ class SelfMonitor:
         *,
         check_same_thread: bool = True,
     ):
-        self.lock = threading.Lock()
+        self._lock = threading.Lock()
         self.conn = sqlite3.connect(db_path, check_same_thread=check_same_thread)
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA synchronous=NORMAL;")
@@ -236,18 +236,19 @@ class SelfMonitor:
     def _add_to_index(self, sha: str, vec: np.ndarray) -> None:
         if faiss is None:
             return
-        dim = len(vec)
-        if self.faiss_index is None:
-            self.faiss_index = faiss.IndexFlatIP(dim)
-            self.faiss_dim = dim
-        if dim != self.faiss_dim:
-            return
-        v = vec.astype("float32")
-        n = np.linalg.norm(v) + 1e-9
-        self.faiss_index.add((v / n).reshape(1, -1))
-        self.faiss_ids.append(sha)
-        faiss.write_index(self.faiss_index, str(self.index_file))
-        self.ids_file.write_text(json.dumps(self.faiss_ids))
+        with self._lock:
+            dim = len(vec)
+            if self.faiss_index is None:
+                self.faiss_index = faiss.IndexFlatIP(dim)
+                self.faiss_dim = dim
+            if dim != self.faiss_dim:
+                return
+            v = vec.astype("float32")
+            n = np.linalg.norm(v) + 1e-9
+            self.faiss_index.add((v / n).reshape(1, -1))
+            self.faiss_ids.append(sha)
+            faiss.write_index(self.faiss_index, str(self.index_file))
+            self.ids_file.write_text(json.dumps(self.faiss_ids))
 
     def snapshot_codebase(self, root: str | Path = ".") -> None:
         root_path = Path(root)
@@ -314,8 +315,11 @@ class SelfMonitor:
 
     # -- logging --------------------------------------------------------------
     def log(self, prompt: str, output: str) -> None:
-        with self.lock:
-            sha = hashlib.sha256(prompt.encode("utf-8", errors="ignore")).hexdigest()
+        sha = hashlib.sha256(prompt.encode("utf-8", errors="ignore")).hexdigest()
+        vec = None
+        if self._ensure_embed_model():
+            vec = self.embed_model.encode([prompt])[0].astype("float32")
+        with self._lock:
             cur = self.conn.cursor()
             cur.execute(
                 "INSERT INTO logs(ts, prompt, output, sha256) VALUES (?,?,?,?)",
@@ -325,18 +329,18 @@ class SelfMonitor:
                 "INSERT INTO prompts_index(prompt, output) VALUES (?,?)",
                 (prompt, output),
             )
-            if self._ensure_embed_model():
-                vec = self.embed_model.encode([prompt])[0].astype("float32")
+            if vec is not None:
                 cur.execute(
                     "INSERT OR REPLACE INTO embeddings(sha256, embedding) VALUES (?,?)",
                     (sha, sqlite3.Binary(vec.tobytes())),
                 )
-                self._add_to_index(sha, vec)
             self.conn.commit()
+        if vec is not None:
+            self._add_to_index(sha, vec)
 
     def note(self, text: str) -> None:
-        with self.lock:
-            sha = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+        sha = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+        with self._lock:
             cur = self.conn.cursor()
             cur.execute(
                 "INSERT INTO notes(ts, text, sha256) VALUES (?, ?, ?)",
@@ -346,7 +350,7 @@ class SelfMonitor:
             self.conn.commit()
 
     def link_prompt(self, prompt_sha: str, note_sha: str, relation: str) -> None:
-        with self.lock:
+        with self._lock:
             cur = self.conn.cursor()
             cur.execute(
                 "INSERT INTO links(src_sha, dst_sha, relation) VALUES (?,?,?)",
