@@ -271,5 +271,3 @@ Acknowledgements
 	•	nanoGPT by Andrej Karpathy
 
 ⸻
-
-License: MIT (or your choice)
