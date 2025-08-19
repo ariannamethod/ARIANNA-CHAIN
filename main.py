@@ -25,7 +25,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send the user's message to Arianna-C server and return the answer."""
-    prompt = update.message.text or ""
+    message = update.effective_message
+    if not message:
+        logging.warning("Update without message: %s", update)
+        return
+    prompt = message.text or ""
     try:
         with SelfMonitor() as sm:
             result = await asyncio.to_thread(call_liquid, prompt)
@@ -36,10 +40,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             sm.log(prompt, text)
         match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
         reply = (match.group(1).strip() if match else answer.strip()) or "(пустой ответ)"
-        await update.message.reply_text(reply)
+        await message.reply_text(reply)
     except Exception as exc:  # pragma: no cover
         logging.exception("Arianna chain request failed")
-        await update.message.reply_text(f"Ошибка: {exc}")
+        await message.reply_text(f"Ошибка: {exc}")
 
 
 async def main() -> None:
