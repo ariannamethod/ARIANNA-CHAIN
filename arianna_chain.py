@@ -713,15 +713,16 @@ def generate_text(
                 prompt_local = f"{combined}\n\nCurrent:\n{prompt_local}"
         if use_liquid:
             try:
-                plan_obj = call_liquid(f"Plan the steps to answer: {prompt_local}", temperature=0.3)
+                plan_obj = call_liquid(f"Plan the steps to answer: {prompt_local}", temperature=0.3, timeout=120.0)
                 plan = str(plan_obj.get("answer", ""))
-                obj = call_liquid(prompt_local, temperature=0.3)
+                obj = call_liquid(prompt_local, temperature=0.3, timeout=120.0)
                 think = str(obj.get("think", ""))
                 answer = str(obj.get("answer", ""))
                 try:
                     verify_obj = call_liquid(
                         f"Question: {prompt_local}\nAnswer: {answer}\nverify the previous answer",
                         temperature=0.0,
+                        timeout=120.0,
                     )
                     verified = str(verify_obj.get("answer", ""))
                     if verified:
@@ -734,14 +735,19 @@ def generate_text(
                 conf = float(obj.get("confidence", 1.0 - entropy))
                 rec = thought_logger.log_turn(text, tokens, entropy, perplexity, conf)
                 if self_reflect:
-                    crit = reflect(prompt_local, text, use_liquid=True)
-                    if "good" not in crit.lower():
-                        repair = call_liquid(
-                            f"Revise using this critique. Return JSON. Draft: {text}\nCritique: {crit}",
-                            temperature=0.0,
-                        )
-                        text = str(repair.get("answer", text))
-                        sm.log("revise", text)
+                    try:
+                        crit = reflect(prompt_local, text, use_liquid=True)
+                        if "good" not in crit.lower():
+                            repair = call_liquid(
+                                f"Revise using this critique. Return JSON. Draft: {text}\nCritique: {crit}",
+                                temperature=0.0,
+                                timeout=60.0,
+                            )
+                            text = str(repair.get("answer", text))
+                            sm.log("revise", text)
+                    except Exception as e:
+                        logger.warning(f"Self-reflection failed, continuing: {e}")
+                        pass
                 if log_reasoning:
                     return text, {"tokens": rec.tokens, "entropy": rec.entropy, "perplexity": rec.perplexity, "timestamp": rec.timestamp}
                 return text
