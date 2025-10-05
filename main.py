@@ -1,4 +1,6 @@
 """Telegram bot interface for Arianna Chain via internal server."""
+from __future__ import annotations
+
 import asyncio
 import logging
 import re
@@ -8,6 +10,7 @@ from arianna_core.config import settings
 from arianna_core.http import call_liquid
 from telegram import Update
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
@@ -46,11 +49,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await message.reply_text(f"Ошибка: {exc}")
 
 
-async def main() -> None:
-    token = settings.telegram_token
+async def _idle_until_cancelled(sleep_interval: float = 3600.0) -> None:
+    """Keep the process alive until the event loop is cancelled."""
+    try:
+        while True:
+            await asyncio.sleep(sleep_interval)
+    except asyncio.CancelledError:  # pragma: no cover - cancellation path
+        logging.info("Shutting down idle Telegram worker")
+
+
+def _build_application(token: str | None) -> Application | None:
+    """Create the Telegram application if a token is provided."""
     if not token:
-        raise RuntimeError("TELEGRAM_TOKEN is required")
-    app = ApplicationBuilder().token(token).build()
+        return None
+    return ApplicationBuilder().token(token).build()
+
+
+async def main() -> None:
+    app = _build_application(settings.telegram_token)
+    if app is None:
+        logging.warning(
+            "TELEGRAM_TOKEN is not set; Telegram worker is disabled."
+        )
+        await _idle_until_cancelled()
+        return
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     await app.run_polling()
