@@ -19,6 +19,29 @@ from telegram.ext import (
 )
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def _preview(text: str, limit: int = 160) -> str:
+    """Return a trimmed preview of *text* for logging."""
+    text = text.replace("\n", " ").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit].rstrip()}…"
+
+
+def _log_sync(prompt: str, output: str) -> None:
+    """Log the interaction in a worker thread."""
+    with SelfMonitor(check_same_thread=False) as sm:
+        sm.log(prompt, output)
+
+
+async def _log_interaction(prompt: str, output: str) -> None:
+    """Persist the interaction without blocking the event loop."""
+    try:
+        await asyncio.to_thread(_log_sync, prompt, output)
+    except Exception:  # pragma: no cover - logging failures are non-critical
+        logger.exception("Failed to persist interaction in SelfMonitor")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -33,20 +56,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logging.warning("Update without message: %s", update)
         return
     prompt = message.text or ""
+    user = getattr(message, "from_user", None)
+    user_id = getattr(user, "id", "unknown")
+    logger.info("Received Telegram message from %s: %s", user_id, _preview(prompt))
     try:
-        with SelfMonitor() as sm:
-            result = await asyncio.to_thread(call_liquid, prompt)
-            plan = result.get("plan", "")
-            think = result.get("think", "")
-            answer = result.get("answer", "")
-            text = f"<plan>{plan}</plan>\n<think>{think}</think>\n<answer>{answer}</answer>"
-            sm.log(prompt, text)
+        result = await asyncio.to_thread(call_liquid, prompt)
+        plan = result.get("plan", "")
+        think = result.get("think", "")
+        answer = result.get("answer", "")
+        text = f"<plan>{plan}</plan>\n<think>{think}</think>\n<answer>{answer}</answer>"
+        asyncio.create_task(_log_interaction(prompt, text))
         match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
         reply = (match.group(1).strip() if match else answer.strip()) or "(пустой ответ)"
+        logger.info("Replying to %s: %s", user_id, _preview(reply))
         await message.reply_text(reply)
     except Exception as exc:  # pragma: no cover
         logging.exception("Arianna chain request failed")
-        await message.reply_text(f"Ошибка: {exc}")
+        error_reply = f"Ошибка: {exc}"
+        logger.info("Replying to %s with error: %s", user_id, _preview(error_reply))
+        await message.reply_text(error_reply)
 
 
 async def _idle_until_cancelled(sleep_interval: float = 3600.0) -> None:
