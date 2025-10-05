@@ -79,6 +79,8 @@ TIME_SENSITIVE_HINTS = ("now", "today", "сейчас", "сегодня", "lates
 CODE_BLOCK_LIMIT     = settings.code_block_limit
 SIMHASH_HAMMING_THR  = settings.simhash_hamming_thr
 
+_RESPONSE_FORMAT_SUPPORTED: Optional[bool] = None
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Авторизация
 # ────────────────────────────────────────────────────────────────────────────────
@@ -364,6 +366,23 @@ def _sanitize_prompt(prompt: str, limit: int = PROMPT_LIMIT_CHARS) -> str:
     prompt = _truncate_large_code_blocks(prompt)
     return prompt
 
+
+JSON_FALLBACK_MARKER = "[JSON_ONLY]"
+JSON_FALLBACK_SUFFIX = (
+    "Return ONLY a valid JSON object with double-quoted keys and values. "
+    "Required keys: mode (plan|act|reflect|final), think (string), answer (string), stop (boolean), "
+    "step (integer >= 1), confidence (number 0..1), halt_reason (final|stagnation|budget|error|client_closed). "
+    "Optional keys: trace_id (string), action (object with name and args object), observation (string), controls (object with "
+    "temperature/top_p/presence_penalty/frequency_penalty numbers), tokens_used (object with input/output/total integers). "
+    "Do not add commentary, markdown fences, or text outside the JSON object."
+)
+
+
+def _json_only_prompt(prompt: str) -> str:
+    if JSON_FALLBACK_MARKER in prompt:
+        return prompt
+    return f"{prompt}\n\n{JSON_FALLBACK_MARKER} {JSON_FALLBACK_SUFFIX}"
+
 def _micro_repair_json(txt: str) -> str:
     s = txt.strip()
     if s.startswith("```"):
@@ -457,14 +476,36 @@ def _detect_red_flags(answer: str) -> list[str]:
 
 def _responses_create(prompt: str, *, model: Optional[str], temperature: float, top_p: float,
                       check_flags: bool = True) -> Tuple[Dict[str, Any], Dict[str, int], Optional[str]]:
+    global _RESPONSE_FORMAT_SUPPORTED
     client = _openai_client()
-    resp = client.responses.create(
-        model=model or MODEL_DEFAULT,
-        input=prompt,
-        temperature=temperature,
-        top_p=top_p,
-        response_format={"type": "json_schema", "json_schema": _response_json_schema()},
-    )
+    use_response_format = _RESPONSE_FORMAT_SUPPORTED is not False
+    payload_prompt = prompt if use_response_format else _json_only_prompt(prompt)
+    kwargs: Dict[str, Any] = {
+        "model": model or MODEL_DEFAULT,
+        "input": payload_prompt,
+        "temperature": temperature,
+        "top_p": top_p,
+    }
+    if use_response_format:
+        kwargs["response_format"] = {
+            "type": "json_schema",
+            "json_schema": _response_json_schema(),
+        }
+    try:
+        resp = client.responses.create(**kwargs)
+        if _RESPONSE_FORMAT_SUPPORTED is None and use_response_format:
+            _RESPONSE_FORMAT_SUPPORTED = True
+    except TypeError as exc:
+        if "response_format" in str(exc) and use_response_format:
+            _RESPONSE_FORMAT_SUPPORTED = False
+            return _responses_create(
+                prompt,
+                model=model,
+                temperature=temperature,
+                top_p=top_p,
+                check_flags=check_flags,
+            )
+        raise
     usage = _extract_usage(resp)
     openai_id = None
     try:
@@ -519,20 +560,44 @@ def _extract_field_partial(buf: str, field: str) -> Optional[str]:
 
 def _responses_stream(prompt: str, *, model: Optional[str], temperature: float, top_p: float
                       ) -> Generator[str, None, None]:
+    global _RESPONSE_FORMAT_SUPPORTED
     client = _openai_client()
+    use_response_format = _RESPONSE_FORMAT_SUPPORTED is not False
+    payload_prompt = prompt if use_response_format else _json_only_prompt(prompt)
+    kwargs: Dict[str, Any] = {
+        "model": model or MODEL_DEFAULT,
+        "input": payload_prompt,
+        "temperature": temperature,
+        "top_p": top_p,
+    }
+    if use_response_format:
+        kwargs["response_format"] = {
+            "type": "json_schema",
+            "json_schema": _response_json_schema(),
+        }
+    try:
+        stream_ctx = client.responses.stream(**kwargs)
+        if _RESPONSE_FORMAT_SUPPORTED is None and use_response_format:
+            _RESPONSE_FORMAT_SUPPORTED = True
+    except TypeError as exc:
+        if "response_format" in str(exc) and use_response_format:
+            _RESPONSE_FORMAT_SUPPORTED = False
+            yield from _responses_stream(
+                prompt,
+                model=model,
+                temperature=temperature,
+                top_p=top_p,
+            )
+            return
+        raise
+
     yield "retry: 10000\n\n"
     yield "event: ping\ndata: {}\n\n"
     last_emit = time.time()
     buf = ""
     field_vals = {"plan": "", "reasoning": "", "repair": ""}
     try:
-        with client.responses.stream(
-            model=model or MODEL_DEFAULT,
-            input=prompt,
-            temperature=temperature,
-            top_p=top_p,
-            response_format={"type": "json_schema", "json_schema": _response_json_schema()},
-        ) as stream:
+        with stream_ctx as stream:
             events = 0
             for ev in stream:
                 now = time.time()
@@ -584,6 +649,17 @@ def _responses_stream(prompt: str, *, model: Optional[str], temperature: float, 
                     last_emit = time.time()
     except GeneratorExit:
         return
+    except TypeError as exc:
+        if "response_format" in str(exc) and use_response_format:
+            _RESPONSE_FORMAT_SUPPORTED = False
+            yield from _responses_stream(
+                prompt,
+                model=model,
+                temperature=temperature,
+                top_p=top_p,
+            )
+            return
+        raise
     except Exception as e:
         obj, _, _ = _responses_create(prompt, model=model, temperature=temperature, top_p=top_p)
         yield f"event: response.completed\ndata: {json.dumps(obj, ensure_ascii=False)}\n\n"
